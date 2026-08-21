@@ -6,6 +6,9 @@ buildscript {
     }
     dependencies {
         classpath 'com.android.tools.build:gradle:8.5.1'
+        // Kotlin for the Hydra layer. 1.9.24 pairs cleanly with AGP 8.5.x
+        // and the Gradle 8.7 wrapper.
+        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24'
     }
 }
 

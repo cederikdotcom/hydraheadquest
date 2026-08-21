@@ -1,3 +1,16 @@
+# HydraHeadQuest
+
+HydraHeadQuest is the Hydra head app for Meta Quest, a fork of
+[moonlight-android-xr](https://github.com/Gilleece/moonlight-android-xr). It adds a Hydra layer
+on top of the Moonlight XR core: the headset enrolls in hydracluster, sends heartbeats, shows
+the experience catalog, selects an eligible body, pairs with its Sunshine instance, and receives
+the stream. It is the Quest sibling of the hydraheadipad app. Issues live at
+[issues.experiencenet.com](https://issues.experiencenet.com) (project hydraheadquest, plan in
+issue #544). See `CLAUDE.md` and `docs/hydra-api-contract.md` for the working details. The
+upstream documentation below still applies to the Moonlight core.
+
+---
+
 <p align="center">
   <img src="moonlight-xr-logo-transparent.png" height="200" alt="moonlight-xr-logo"><br>
   <a href="https://ko-fi.com/moonlightxr">

@@ -16,6 +16,12 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Hydra enrollment QR scanning (issue #544). Optional so phones and
+         TVs without a camera still install -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
@@ -261,6 +267,17 @@
         <service
             android:name=".binding.input.driver.UsbDriverService"
             android:label="Usb Driver Service" />
+
+        <!-- Hydra head enrollment (issue #544). Exported so adb can start it
+             with server_url and enrollment_token extras during Phase 1 -->
+        <activity
+            android:name=".hydra.HydraEnrollmentActivity"
+            android:exported="true"
+            android:resizeableActivity="true"
+            android:label="Hydra Enrollment"
+            android:configChanges="mcc|mnc|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection">
+            <meta-data android:name="pvr.app.type" android:value="2d" />
+        </activity>
 
         <activity
             android:name=".HelpActivity"
