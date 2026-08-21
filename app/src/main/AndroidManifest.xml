@@ -19,6 +19,8 @@
     <!-- Hydra enrollment QR scanning (issue #544). Optional so phones and
          TVs without a camera still install -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Quest 3/3S passthrough camera access, Horizon OS v74+. Ignored elsewhere -->
+    <uses-permission android:name="horizonos.permission.HEADSET_CAMERA" />
     <uses-feature
         android:name="android.hardware.camera"
         android:required="false" />
@@ -91,6 +93,7 @@
     <uses-permission android:name="com.picovr.permission.EYE_TRACKING" />
 
     <application
+        android:name=".hydra.HydraApp"
         android:allowBackup="true"
         android:fullBackupContent="@xml/backup_rules"
         android:dataExtractionRules="@xml/backup_rules_s"
@@ -267,6 +270,36 @@
         <service
             android:name=".binding.input.driver.UsbDriverService"
             android:label="Usb Driver Service" />
+
+        <!-- Hydra kiosk launcher (issue #544). Routes to enrollment when
+             unconfigured and to the catalog when enrolled. An additional
+             launcher entry so upstream's PcView stays reachable for
+             debugging; to make Hydra the sole launcher later, remove the
+             LAUNCHER category from PcView's intent-filter above -->
+        <activity
+            android:name=".hydra.HydraLaunchActivity"
+            android:exported="true"
+            android:resizeableActivity="true"
+            android:label="Hydra Kiosk"
+            android:configChanges="mcc|mnc|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <meta-data android:name="pvr.app.type" android:value="2d" />
+        </activity>
+
+        <!-- Hydra experience catalog (issue #544). singleTask so stream
+             teardown can bring the existing instance back to the front -->
+        <activity
+            android:name=".hydra.HydraCatalogActivity"
+            android:exported="false"
+            android:resizeableActivity="true"
+            android:label="Hydra Catalog"
+            android:launchMode="singleTask"
+            android:configChanges="mcc|mnc|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection">
+            <meta-data android:name="pvr.app.type" android:value="2d" />
+        </activity>
 
         <!-- Hydra head enrollment (issue #544). Exported so adb can start it
              with server_url and enrollment_token extras during Phase 1 -->

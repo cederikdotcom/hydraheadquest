@@ -113,23 +113,11 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
     /**
      * Integration surface toward the Moonlight streaming stack.
      *
-     * TODO(#544): implement in the activity layer. The launch path must:
-     * 1. Build com.limelight.nvstream.http.NvHTTP against http://host:47989
-     *    (DEFAULT_HTTP_PORT) and let it discover HTTPS 47984 from /serverinfo.
-     *    Never point pairing at 47990.
-     * 2. Pair with com.limelight.nvstream.http.PairingManager.pair(serverInfo,
-     *    pin). Return the PIN from the UI callback immediately, then after
-     *    0.3 s call postPinToSunshine() below so the PIN lands while the
-     *    /pair getservercert request is still pending.
-     * 3. On PairState.ALREADY_IN_PROGRESS or a stale pairing, call
-     *    NvHTTP.unpair() with the SAME uniqueid the pairing lib used, then
-     *    re-pair once (guard flag; a second alreadyPaired returns an empty
-     *    cert). Never cache the server cert between sessions.
-     * 4. Start the stream through com.limelight.nvstream.NvConnection with
-     *    app = experience name (= stream_app_id), 60 fps, resolution from
-     *    Experience.streamWidth/streamHeight, bitrate 150000 kbps on LAN or
-     *    20000 kbps when the host starts with "10.10." (WireGuard), and pass
-     *    the freshly paired server cert.
+     * Implemented by [HydraStreamHooks] against the real Moonlight core:
+     * NvHTTP pairing on http://host:47989 (HTTPS 47984 discovered from
+     * /serverinfo, never 47990), PairingManager with the PIN posted to
+     * Sunshine via [postPinToSunshine], app list lookup, and a Game or
+     * GameXR activity launch. HydraApp wires the instance in at startup.
      */
     interface StreamHooks {
         /**
@@ -165,17 +153,32 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
 
     /**
      * Screenshot provider for the remote screenshot command. Returns JPEG
-     * bytes (quality 0.7) or null when capture is not possible.
+     * bytes (quality 70) or null when capture is not possible. HydraApp
+     * wires this to [HydraScreenshot] (PixelCopy of the current activity).
      *
-     * TODO(#544): video surfaces may capture black on Quest, same as the
-     * Metal capture issue on iPad. MediaProjection may be needed.
+     * TODO(#544): the streaming video surface may capture black on Quest,
+     * same as the Metal capture issue on iPad. MediaProjection may be
+     * needed for stream frames. The wire contract is unaffected.
      */
     @Volatile
     var screenshotProvider: (() -> ByteArray?)? = null
 
+    /**
+     * Supplies the Moonlight unique client id for heartbeat diagnostics.
+     * HydraApp wires this to the IdentityManager uid.
+     */
+    @Volatile
+    var moonlightClientIdProvider: (() -> String?)? = null
+
     private var client: HydraClusterClient? = null
+
+    @Volatile
     private var enrollment: EnrollmentConfig? = null
+
+    @Volatile
     private var cachedConfig: HeadConfig? = null
+
+    @Volatile
     private var cachedCatalog: List<Experience> = emptyList()
     private var tickFuture: ScheduledFuture<*>? = null
     private var commandFuture: ScheduledFuture<*>? = null
@@ -198,6 +201,34 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
             adopt(config)
         }
     }
+
+    /**
+     * Adopt a stored enrollment when the machine has not adopted one yet.
+     * Safe to call from activity onResume: a no-op while enrolled and
+     * running, and a plain state refresh while unenrolled. This is how the
+     * catalog picks up an enrollment the enrollment activity saved straight
+     * to the store.
+     */
+    fun ensureStarted() {
+        executor.execute {
+            if (enrollment != null) return@execute
+            val config = store.load()
+            if (config == null) {
+                setState(State.Unconfigured)
+            } else {
+                adopt(config)
+            }
+        }
+    }
+
+    /** Latest head config from the cluster, or null before the first tick. */
+    fun currentHeadConfig(): HeadConfig? = cachedConfig
+
+    /** Latest experience catalog snapshot. */
+    fun currentCatalog(): List<Experience> = cachedCatalog
+
+    /** This head's id, or null when unenrolled. */
+    fun currentHeadId(): String? = enrollment?.headId
 
     /** Adopt a fresh enrollment (called right after enroll succeeds). */
     fun onEnrolled(config: EnrollmentConfig) {
@@ -281,6 +312,45 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
                 }
             }
             setState(State.Error("Session interrupted. The connection was lost."))
+            scheduleTick(IDLE_TICK_SECONDS)
+        }
+    }
+
+    /**
+     * The streaming activity went away without an explicit stop from the
+     * catalog: the user exited the stream in Game, or the session ended on
+     * its own after frames flowed. Return to the grid. The DELETE frees the
+     * body slot; a failure is non-fatal (the body heartbeat self-corrects).
+     */
+    fun onStreamEnded() {
+        executor.execute {
+            val current = state
+            if (current !is State.Streaming) return@execute
+            try {
+                client?.deleteStream(current.bodyId)
+            } catch (e: IOException) {
+                Log.w(TAG, "deleteStream on stream end failed: ${e.message}")
+            }
+            setState(State.SelfService(cachedCatalog))
+            scheduleTick(IDLE_TICK_SECONDS)
+        }
+    }
+
+    /**
+     * Pairing, app lookup, or the activity launch failed before the stream
+     * was established. Called by StreamHooks with a user-readable message.
+     */
+    fun onStreamFailed(message: String) {
+        executor.execute {
+            val current = state
+            if (current is State.Streaming) {
+                try {
+                    client?.deleteStream(current.bodyId)
+                } catch (e: IOException) {
+                    Log.w(TAG, "deleteStream on stream failure failed: ${e.message}")
+                }
+            }
+            setState(State.Error(message))
             scheduleTick(IDLE_TICK_SECONDS)
         }
     }
@@ -444,12 +514,10 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
                 // The integration layer calls onStreamEstablished() or
                 // onStreamInterrupted() from the NvConnectionListener callbacks.
             } else {
-                // TODO(#544): wire StreamHooks to the Moonlight stack. See the
-                // StreamHooks doc comment for the exact NvHTTP, PairingManager,
-                // and NvConnection call sequence. Until then the scaffold
-                // cannot stream, so surface a clear error.
-                Log.w(TAG, "StreamHooks not wired; cannot stream yet")
-                setState(State.Error("Streaming not wired yet (issue #544 phase 1)"))
+                // HydraApp wires HydraStreamHooks at startup, so this branch
+                // only fires when HydraApp is not registered in the manifest.
+                Log.w(TAG, "StreamHooks not wired; cannot stream")
+                setState(State.Error("Streaming is not available (no stream hooks)"))
             }
         } catch (e: IOException) {
             setState(State.Error("Body discovery failed: ${e.message}"))
@@ -494,6 +562,20 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
         val current = state
         val status = statusFor(current)
         val bodyId = (current as? State.Streaming)?.bodyId
+        try {
+            apiClient.putHeartbeat(status, bodyId, collectDiagnostics())
+        } catch (e: IOException) {
+            Log.w(TAG, "heartbeat failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Build the diagnostics block the heartbeat sends. Also shown in the
+     * operator diagnostics view, so both always agree. Blocking: probes the
+     * assignment host on TCP 47990 with a 5 s cap. Never call this on the
+     * main thread.
+     */
+    fun collectDiagnostics(): HeadDiagnostics {
         // Latency and routing always describe the resolved assignment host
         // from head config, like the iPad app. "?" and "unknown" when the
         // config carries no assignment.
@@ -508,7 +590,12 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
         } else {
             "?"
         }
-        val diagnostics = HeadDiagnostics(
+        val clientId = try {
+            moonlightClientIdProvider?.invoke()
+        } catch (e: Exception) {
+            null
+        }
+        return HeadDiagnostics(
             version = "v" + BuildConfig.VERSION_NAME,
             // TODO(#544): Phase 2, report the wireguard-android tunnel state
             // once the VpnService path is verified on Horizon OS.
@@ -517,16 +604,8 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
             latencyMs = latency,
             wifiSsid = currentSsid(),
             localIp = localIpAddress(),
-            // TODO(#544): report the Moonlight unique id from
-            // com.limelight.computers.ComputerManagerService / IdentityManager
-            // once the streaming stack is wired.
-            moonlightClientId = null
+            moonlightClientId = clientId
         )
-        try {
-            apiClient.putHeartbeat(status, bodyId, diagnostics)
-        } catch (e: IOException) {
-            Log.w(TAG, "heartbeat failed: ${e.message}")
-        }
     }
 
     private fun statusFor(state: State): String = when (state) {

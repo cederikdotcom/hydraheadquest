@@ -1,30 +1,41 @@
 package com.limelight.hydra
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.pm.PackageManager
+import android.graphics.SurfaceTexture
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
+import android.view.TextureView
+import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import com.limelight.hydra.model.FleetEnrollQR
 import java.io.IOException
 import kotlin.concurrent.thread
 
 /**
- * Minimal enrollment screen for Phase 1 development.
+ * Enrollment screen: QR scan first, manual entry as fallback.
  *
- * The production flow scans the fleet QR code with the passthrough camera.
- * TODO(#544): add QR scanning. Do not add a QR dependency yet; evaluate
- * CameraX plus ML Kit against a plain zxing-core decode first, and check
- * what Horizon OS allows for camera access on managed devices.
+ * The production flow scans the fleet QR code (JSON with server_url and
+ * enrollment_token, see docs/hydra-api-contract.md section 2) through
+ * [HydraQrScanner]. On Meta Quest 3 / 3S the passthrough camera needs
+ * Horizon OS v74+ and BOTH android.permission.CAMERA and
+ * horizonos.permission.HEADSET_CAMERA granted at runtime. Where the camera
+ * is absent or refused (older Quests, denied permission), the screen falls
+ * back to manual entry with a short note. It never crashes on camera absence.
  *
- * For now the server URL and enrollment token arrive either typed into the
- * text fields or via intent extras, which adb can set:
+ * The manual path stays fully supported. The server URL and enrollment token
+ * can be typed into the text fields or passed as intent extras, which adb
+ * can set:
  *
  *   adb shell am start \
  *     -n com.experiencenet.hydraheadquest/com.limelight.hydra.HydraEnrollmentActivity \
@@ -33,18 +44,30 @@ import kotlin.concurrent.thread
  *
  * The UI is built in code so the scaffold adds no layout resources.
  */
-class HydraEnrollmentActivity : Activity() {
+class HydraEnrollmentActivity : Activity(), HydraQrScanner.Listener {
 
     companion object {
         const val EXTRA_SERVER_URL = "server_url"
         const val EXTRA_ENROLLMENT_TOKEN = "enrollment_token"
+
+        /** Quest passthrough camera permission, Horizon OS v74+. */
+        private const val HEADSET_CAMERA_PERMISSION = "horizonos.permission.HEADSET_CAMERA"
+
+        private const val REQUEST_CAMERA_PERMISSIONS = 1
     }
 
     private lateinit var store: HydraConfigStore
     private lateinit var statusView: TextView
+    private lateinit var previewView: TextureView
+    private lateinit var scanButton: Button
     private lateinit var serverUrlField: EditText
     private lateinit var tokenField: EditText
     private lateinit var enrollButton: Button
+
+    private var scanner: HydraQrScanner? = null
+
+    /** True between "Scan fleet QR" and a decode, error, or stop. */
+    private var scanRequested = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -69,6 +92,26 @@ class HydraEnrollmentActivity : Activity() {
         }
         root.addView(statusView)
 
+        // Small live preview for the QR scan. Hidden until a scan starts.
+        previewView = TextureView(this).apply {
+            visibility = View.GONE
+            surfaceTextureListener = previewListener
+        }
+        val previewHeight = (220 * resources.displayMetrics.density).toInt()
+        root.addView(
+            previewView,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                previewHeight
+            ).apply { topMargin = 16 }
+        )
+
+        scanButton = Button(this).apply {
+            text = "Scan fleet QR"
+            setOnClickListener { requestScan() }
+        }
+        root.addView(scanButton, matchWidth())
+
         serverUrlField = EditText(this).apply {
             hint = "Server URL (https://...)"
             inputType = InputType.TYPE_TEXT_VARIATION_URI
@@ -85,7 +128,7 @@ class HydraEnrollmentActivity : Activity() {
 
         enrollButton = Button(this).apply {
             text = "Enroll"
-            setOnClickListener { startEnrollment() }
+            setOnClickListener { startManualEnrollment() }
         }
         root.addView(enrollButton, matchWidth())
 
@@ -115,6 +158,17 @@ class HydraEnrollmentActivity : Activity() {
         refreshStatus()
     }
 
+    override fun onPause() {
+        super.onPause()
+        // Release the camera whenever the screen leaves the foreground.
+        stopScanning()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        stopScanning()
+    }
+
     private fun matchWidth(): LinearLayout.LayoutParams {
         return LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -127,21 +181,187 @@ class HydraEnrollmentActivity : Activity() {
         if (config != null) {
             statusView.text = "Enrolled as head ${config.headId}\nServer: ${config.serverUrl}"
             enrollButton.isEnabled = false
+            scanButton.isEnabled = false
         } else {
-            statusView.text = "Not enrolled. Scan the fleet QR code (TODO #544) " +
+            statusView.text = "Not enrolled. Scan the fleet QR code " +
                     "or enter the server URL and token."
             enrollButton.isEnabled = true
+            scanButton.isEnabled = true
         }
     }
 
-    private fun startEnrollment() {
+    // ------------------------------------------------------------------
+    // QR scanning
+    // ------------------------------------------------------------------
+
+    /** "Scan fleet QR" tapped: get the permissions, then start the camera. */
+    private fun requestScan() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            // Pre-M grants install-time permissions; just scan.
+            startScanning()
+            return
+        }
+        val missing = ArrayList<String>(2)
+        if (checkSelfPermission(Manifest.permission.CAMERA) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            missing.add(Manifest.permission.CAMERA)
+        }
+        // Only request HEADSET_CAMERA where the platform defines it
+        // (Horizon OS v74+). Other devices would report a stuck denial.
+        if (isPermissionKnown(HEADSET_CAMERA_PERMISSION) &&
+            checkSelfPermission(HEADSET_CAMERA_PERMISSION) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            missing.add(HEADSET_CAMERA_PERMISSION)
+        }
+        if (missing.isEmpty()) {
+            startScanning()
+        } else {
+            requestPermissions(missing.toTypedArray(), REQUEST_CAMERA_PERMISSIONS)
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQUEST_CAMERA_PERMISSIONS) return
+        var cameraGranted = true
+        for (i in permissions.indices) {
+            if (permissions[i] == Manifest.permission.CAMERA &&
+                grantResults[i] != PackageManager.PERMISSION_GRANTED
+            ) {
+                cameraGranted = false
+            }
+        }
+        if (cameraGranted) {
+            // A denied HEADSET_CAMERA leaves camera enumeration empty on
+            // Quest; the scanner reports that and we fall back cleanly.
+            startScanning()
+        } else {
+            fallBackToManual("Camera permission denied.")
+        }
+    }
+
+    private fun isPermissionKnown(permission: String): Boolean {
+        return try {
+            packageManager.getPermissionInfo(permission, 0)
+            true
+        } catch (e: PackageManager.NameNotFoundException) {
+            false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun startScanning() {
+        stopScanning()
+        scanRequested = true
+        previewView.visibility = View.VISIBLE
+        statusView.text = "Scan the fleet QR."
+        val texture = if (previewView.isAvailable) previewView.surfaceTexture else null
+        if (texture != null) {
+            launchScanner(texture)
+        }
+        // Otherwise previewListener.onSurfaceTextureAvailable launches it.
+    }
+
+    private fun launchScanner(texture: SurfaceTexture) {
+        if (!scanRequested || scanner != null) return
+        scanner = HydraQrScanner(this, texture, this).also { it.start() }
+    }
+
+    private fun stopScanning() {
+        scanRequested = false
+        scanner?.stop()
+        scanner = null
+        previewView.visibility = View.GONE
+    }
+
+    /** Camera absent, refused, or broken: manual entry with a short note. */
+    private fun fallBackToManual(reason: String) {
+        stopScanning()
+        statusView.text = "Camera scan unavailable: $reason\n" +
+                "Enter the server URL and enrollment token below."
+    }
+
+    private val previewListener = object : TextureView.SurfaceTextureListener {
+        override fun onSurfaceTextureAvailable(
+            surface: SurfaceTexture, width: Int, height: Int
+        ) {
+            launchScanner(surface)
+        }
+
+        override fun onSurfaceTextureSizeChanged(
+            surface: SurfaceTexture, width: Int, height: Int
+        ) {
+        }
+
+        override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+            scanner?.stop()
+            scanner = null
+            return true
+        }
+
+        override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
+        }
+    }
+
+    // HydraQrScanner.Listener, called on the scanner's background thread.
+
+    override fun onQrDecoded(text: String): Boolean {
+        val qr = FleetEnrollQR.fromJson(text)
+        if (qr == null) {
+            // Not the fleet QR. Keep the camera running.
+            runOnUiThread {
+                if (scanRequested) {
+                    statusView.text = "That QR is not a fleet enrollment code. " +
+                            "Aim at the fleet QR."
+                }
+            }
+            return false
+        }
+        runOnUiThread {
+            stopScanning()
+            // Mirror the payload into the fields so the operator sees what
+            // was scanned (the token field is plain text on purpose; the
+            // enrollment token is short lived and fleet scoped).
+            serverUrlField.setText(qr.serverUrl)
+            tokenField.setText(qr.enrollmentToken)
+            enroll(qr.serverUrl, qr.enrollmentToken)
+        }
+        return true
+    }
+
+    override fun onScannerError(message: String) {
+        runOnUiThread { fallBackToManual(message) }
+    }
+
+    // ------------------------------------------------------------------
+    // Enrollment (shared by the QR and manual paths)
+    // ------------------------------------------------------------------
+
+    private fun startManualEnrollment() {
         val serverUrl = serverUrlField.text.toString().trim()
         val token = tokenField.text.toString().trim()
         if (serverUrl.isEmpty() || token.isEmpty()) {
             statusView.text = "Server URL and enrollment token are both required."
             return
         }
+        stopScanning()
+        enroll(serverUrl, token)
+    }
+
+    /**
+     * POST /api/v1/heads with the fleet token, persist the per-device
+     * config, and show the enrolled state. Identical for QR and manual.
+     */
+    private fun enroll(serverUrl: String, token: String) {
         enrollButton.isEnabled = false
+        scanButton.isEnabled = false
         statusView.text = "Enrolling..."
         val name = defaultHeadName()
         thread(name = "HydraEnroll") {
@@ -158,6 +378,7 @@ class HydraEnrollmentActivity : Activity() {
                 runOnUiThread {
                     statusView.text = "Enrollment failed: ${e.message}"
                     enrollButton.isEnabled = true
+                    scanButton.isEnabled = true
                 }
             }
         }

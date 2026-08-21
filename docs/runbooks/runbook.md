@@ -77,7 +77,23 @@ APK output: `app/build/outputs/apk/nonRoot/<buildType>/`. The debug APK is
 signed with the debug key and installs directly. The release APK is UNSIGNED
 (`app-nonRoot-release-unsigned.apk`); `adb install` rejects it until it is
 signed with zipalign plus apksigner (see the README signing section). CI signs
-release APKs when the keystore secrets are set.
+release APKs; the keystore secrets are configured (see Signing key below).
+
+## Signing key
+
+Set up 2026-08-21. The release signing key is a PKCS12 keystore, RSA 4096,
+self-signed certificate valid to 2056, alias `hydraheadquest`.
+
+- GitHub secrets on this repo: `ANDROID_KEYSTORE_BASE64`,
+  `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`
+  (PKCS12: key password equals store password).
+- Master copy: `~/.hydraheadquest/release.p12` plus
+  `release-keystore-password.txt` on the workstation, mode 600.
+- Backup: Hetzner Storage Box u645590 (SSH port 23, Hetzner internal),
+  `hydramdm-backups/hydraheadquest-signing/`.
+- Never lose or rotate this key casually. Android updates install only when
+  the new APK is signed with the same key. A lost key means uninstall and
+  reinstall on every headset.
 
 ## Sideload deploy for the pilot
 
@@ -92,8 +108,8 @@ This is the Phase 1 deploy lane. One headset, one cable or one venue LAN.
 3. Install a signed APK. Pick one source:
 
    - Release lane (preferred): download `hydraheadquest-<version>.apk` from the
-     GitHub release or the `hydraheadquest-apk` CI artifact. CI signs it when
-     the keystore secrets are set.
+     GitHub release or the `hydraheadquest-apk` CI artifact. CI signs release
+     APKs since v0.2.0 (secrets configured 2026-08-21).
    - Local debug build (quick iteration; application id gets a `.debug`
      suffix):
 
