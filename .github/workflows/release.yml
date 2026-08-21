@@ -44,15 +44,23 @@ jobs:
         VERSION=${GITHUB_REF#refs/tags/}
         echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-    - name: Check for publish token
+    - name: Check for secrets
       id: check_publish
+      # The secrets context is not allowed in step-level if expressions,
+      # so expose presence flags as step outputs instead.
       env:
         HYDRARELEASE_TOKEN: ${{ secrets.HYDRARELEASE_PUBLISH_TOKEN }}
+        KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
       run: |
         if [ -n "$HYDRARELEASE_TOKEN" ]; then
           echo "has_publish_token=true" >> $GITHUB_OUTPUT
         else
           echo "has_publish_token=false" >> $GITHUB_OUTPUT
+        fi
+        if [ -n "$KEYSTORE_B64" ]; then
+          echo "has_keystore=true" >> $GITHUB_OUTPUT
+        else
+          echo "has_keystore=false" >> $GITHUB_OUTPUT
         fi
 
     - name: Build release APK (nonRoot flavor)
@@ -71,7 +79,7 @@ jobs:
         cp "$APK" dist/hydraheadquest-unsigned.apk
 
     - name: Sign APK with apksigner
-      if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+      if: ${{ steps.check_publish.outputs.has_keystore == 'true' }}
       env:
         ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -92,7 +100,7 @@ jobs:
         rm -f keystore.jks dist/hydraheadquest-unsigned.apk dist/hydraheadquest-aligned.apk
 
     - name: No keystore secrets set, APK stays unsigned
-      if: ${{ secrets.ANDROID_KEYSTORE_BASE64 == '' }}
+      if: ${{ steps.check_publish.outputs.has_keystore != 'true' }}
       run: |
         VERSION=${{ steps.get_version.outputs.version }}
         mv dist/hydraheadquest-unsigned.apk "dist/hydraheadquest-$VERSION.apk"
@@ -109,7 +117,7 @@ jobs:
         if-no-files-found: error
 
     - name: Create GitHub Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         name: ${{ steps.get_version.outputs.version }}
         draft: false
