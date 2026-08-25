@@ -54,8 +54,9 @@ public class PreferenceConfiguration {
     private static final String VR_HEAD_LOCKED_PREF_STRING = "checkbox_vr_head_locked";
     private static final String VR_DISTANCE_PREF_STRING = "seekbar_vr_distance";
     private static final String VR_SCREEN_SIZE_PREF_STRING = "seekbar_vr_screen_size";
-    private static final String VR_CURVATURE_PREF_STRING = "seekbar_vr_curvature";
-    private static final String VR_DEPTH_SOURCE_PREF_STRING = "list_vr_depth_source";
+    // Public so the Hydra layer can seed first-run defaults (HydraApp)
+    public static final String VR_CURVATURE_PREF_STRING = "seekbar_vr_curvature";
+    public static final String VR_DEPTH_SOURCE_PREF_STRING = "list_vr_depth_source";
     private static final String VR_EYE_SWAP_PREF_STRING = "checkbox_vr_eye_swap";
     public static final String VR_PASSTHROUGH_PREF_STRING = "checkbox_vr_passthrough";
     private static final String VR_POINTER_PREF_STRING = "checkbox_vr_pointer";

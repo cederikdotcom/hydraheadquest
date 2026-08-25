@@ -19,6 +19,7 @@ import android.preference.PreferenceManager;
 import android.view.Surface;
 
 import com.limelight.LimeLog;
+import com.limelight.hydra.HydraAmbient;
 import com.limelight.preferences.PreferenceConfiguration;
 
 import java.io.File;
@@ -132,9 +133,13 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
 
     // Environment picker, a grid of thumbnails reachable from inside the
     // session. The first two cells are passthrough and an empty black room,
-    // the rest are the photos in the assets folder, in name order. Must match
-    // the PICKER_ constants in xr_renderer.c.
+    // then the generated ambient gradient, then the photos in the assets
+    // folder, in name order. Must match the PICKER_ constants in xr_renderer.c.
     private static final String ENVIRONMENT_DIR = "environments";
+    // Size of the generated ambient equirect. Small on purpose: the photos
+    // at 4096x2048 were too heavy for the Quest 2 GPU beside the stream.
+    private static final int AMBIENT_TEX_W = 1024;
+    private static final int AMBIENT_TEX_H = 512;
     private static final int PICKER_COLS = 3;
     private static final int PICKER_ROWS = 2;
     private static final int PICKER_CELLS = PICKER_COLS * PICKER_ROWS;
@@ -494,15 +499,24 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
      * would hold up the first frame and hang the shell on its loading screen.
      */
     private void startEnvironment(PreferenceConfiguration prefs) {
+        String[] found = new String[0];
         try {
-            String[] found = prefsContext.getAssets().list(ENVIRONMENT_DIR);
-            if (found != null) {
-                Arrays.sort(found);
-                environmentFiles = Arrays.copyOf(found, Math.min(found.length, MAX_PHOTOS));
+            String[] listed = prefsContext.getAssets().list(ENVIRONMENT_DIR);
+            if (listed != null) {
+                Arrays.sort(listed);
+                found = listed;
             }
         } catch (IOException e) {
             LimeLog.warning("No environments: " + e);
         }
+        // The generated ambient preset takes the first photo cell, the asset
+        // photos fill the rest of the grid in name order
+        String[] combined = new String[Math.min(found.length, MAX_PHOTOS - 1) + 1];
+        combined[0] = HydraAmbient.ENTRY;
+        for (int i = 1; i < combined.length; i++) {
+            combined[i] = found[i - 1];
+        }
+        environmentFiles = combined;
 
         int cell = PreferenceManager.getDefaultSharedPreferences(prefsContext)
                 .getInt(PreferenceConfiguration.VR_ENVIRONMENT_PREF_STRING, -1);
@@ -577,8 +591,15 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
 
         InputStream in = null;
         try {
-            in = prefsContext.getAssets().open(ENVIRONMENT_DIR + "/" + environmentFiles[photo]);
-            Bitmap bitmap = BitmapFactory.decodeStream(in);
+            Bitmap bitmap;
+            if (HydraAmbient.ENTRY.equals(environmentFiles[photo])) {
+                // Generated rather than decoded, small enough to be instant
+                bitmap = HydraAmbient.render(AMBIENT_TEX_W, AMBIENT_TEX_H);
+            }
+            else {
+                in = prefsContext.getAssets().open(ENVIRONMENT_DIR + "/" + environmentFiles[photo]);
+                bitmap = BitmapFactory.decodeStream(in);
+            }
             if (bitmap == null || photoRequest.get() != ticket) {
                 return;
             }
@@ -736,6 +757,9 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     // Sampled down on the way out of the JPEG, since a full 4096x2048 decode
     // for a 240 pixel tile would cost 32 MB apiece
     private Bitmap decodeThumb(String fileName, int wanted) {
+        if (HydraAmbient.ENTRY.equals(fileName)) {
+            return HydraAmbient.render(wanted * 2, wanted);
+        }
         InputStream in = null;
         try {
             BitmapFactory.Options bounds = new BitmapFactory.Options();

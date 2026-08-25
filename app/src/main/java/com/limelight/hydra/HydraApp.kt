@@ -70,7 +70,7 @@ class HydraApp : Application() {
     override fun onCreate() {
         super.onCreate()
 
-        seedVrEnvironmentDefault()
+        seedVrDefaults()
 
         hydraWireGuard = HydraWireGuard(this)
         hydraState = HydraState(this, HydraConfigStore(this))
@@ -132,26 +132,48 @@ class HydraApp : Application() {
     }
 
     /**
-     * Seed the XR streaming environment to the black void on first run.
+     * Seed the XR streaming defaults on first run, before the renderer
+     * or the settings page read them. Each key is seeded only while it
+     * is absent, so a later user choice (settings or in-stream picker)
+     * always wins and is never overwritten.
      *
-     * Upstream XrRenderer defaults an unset "vr_environment" preference
-     * to the first 4096x2048 equirect photo. That extra composited
-     * background layer is too heavy for the Quest 2 GPU while it also
-     * decodes a 1080p60 stream: the stream visibly chops. The void
-     * (picker cell 1) submits no background layer at all, so it is the
-     * lightest option, cheaper than passthrough too.
-     *
-     * Seeding the preference here keeps upstream code untouched. The
-     * in-stream environment picker still works: a user pick overwrites
-     * this value, and we never seed again once the key exists.
+     * - vr_environment 2: the generated Ambient Dusk gradient, picker
+     *   cell 2 (0 is passthrough, 1 the black void, 2 and up photos).
+     *   XrRenderer registers the generated preset as the first photo
+     *   cell. It is a 1024x512 texture, about 1/32 of the 4096x2048
+     *   photos that chopped the stream on the Quest 2, so the head
+     *   gets a dimly lit room at close to void cost.
+     * - list_vr_depth_source "off": upstream defaults to "model", the
+     *   MiDaS depth net. It doubles the video swapchain width for
+     *   synthesized stereo and warps each eye by an aging depth map.
+     *   On the Quest 2 that is GPU budget we do not have, and the warp
+     *   shows as reprojection artifacts when the head turns.
+     * - seekbar_vr_curvature 100: shows the screen as a cylinder
+     *   compositor layer with radius equal to the screen distance, the
+     *   usual VR media screen wrap. Upstream falls back to the flat
+     *   quad by itself on runtimes without
+     *   XR_KHR_composition_layer_cylinder.
      */
-    private fun seedVrEnvironmentDefault() {
+    private fun seedVrDefaults() {
         val prefs = PreferenceManager.getDefaultSharedPreferences(this)
+        val edit = prefs.edit()
         if (!prefs.contains(PreferenceConfiguration.VR_ENVIRONMENT_PREF_STRING)) {
-            // 1 = XrRenderer CELL_VOID (0 is passthrough, 2 and up are photos).
-            prefs.edit()
-                .putInt(PreferenceConfiguration.VR_ENVIRONMENT_PREF_STRING, 1)
-                .apply()
+            edit.putInt(PreferenceConfiguration.VR_ENVIRONMENT_PREF_STRING, 2)
+        } else if (prefs.getInt("hydra_seed_version", 1) < 2 &&
+            prefs.getInt(PreferenceConfiguration.VR_ENVIRONMENT_PREF_STRING, -1) == 1
+        ) {
+            // One-time migration: v0.4.1 seeded the black void (1). Move
+            // those devices to Ambient Dusk (2) unless the user picked a
+            // different environment themselves (value != 1).
+            edit.putInt(PreferenceConfiguration.VR_ENVIRONMENT_PREF_STRING, 2)
         }
+        edit.putInt("hydra_seed_version", 2)
+        if (!prefs.contains(PreferenceConfiguration.VR_DEPTH_SOURCE_PREF_STRING)) {
+            edit.putString(PreferenceConfiguration.VR_DEPTH_SOURCE_PREF_STRING, "off")
+        }
+        if (!prefs.contains(PreferenceConfiguration.VR_CURVATURE_PREF_STRING)) {
+            edit.putInt(PreferenceConfiguration.VR_CURVATURE_PREF_STRING, 100)
+        }
+        edit.apply()
     }
 }

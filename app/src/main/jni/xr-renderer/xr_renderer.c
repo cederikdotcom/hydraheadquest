@@ -394,6 +394,10 @@ typedef struct {
     XrPath msftHandProfile;
     int handTracking;
     int handClickOk;
+    // The Quest hand menu gesture (a quick pinch on the shown left palm)
+    // arrives as a status bit beside the joints, not as an action
+    int fbAim;
+    int aimMenuPressed[HAND_COUNT];
     // Looking at something instead of pointing at it. Lowest priority of the
     // three, so a controller or a hand always wins when one is aiming.
     int eyeGaze;
@@ -431,6 +435,7 @@ typedef struct {
     XrAction scrollAction;
     XrAction grabAction;
     XrAction toggleAction;
+    XrAction menuAction;
     XrSpace aimSpaces[SRC_COUNT];
     XrPath handPaths[HAND_COUNT];
     int inputReady;
@@ -439,6 +444,7 @@ typedef struct {
     // absolute positions fight any game that does its own mouse look
     int pointerOn;
     int togglePrev;
+    int menuPrev;
     int triggerDown[SRC_COUNT];
     // Rising edges, so a button already held when the ray wanders onto a handle
     // does not grab it. Dragging a window on the host desktop past the edge of
@@ -934,6 +940,7 @@ static int initXrInstance(XrCtx* ctx) {
         if (!strcmp(exts[i].extensionName, XR_MSFT_HAND_INTERACTION_EXTENSION_NAME)) ctx->msftHandInteraction = 1;
         if (!strcmp(exts[i].extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME)) ctx->handTracking = 1;
         if (!strcmp(exts[i].extensionName, XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME)) ctx->eyeGaze = 1;
+        if (!strcmp(exts[i].extensionName, XR_FB_HAND_TRACKING_AIM_EXTENSION_NAME)) ctx->fbAim = 1;
     }
     free(exts);
 
@@ -942,7 +949,7 @@ static int initXrInstance(XrCtx* ctx) {
         return 0;
     }
 
-    const char* enabledExts[9];
+    const char* enabledExts[10];
     uint32_t enabledCount = 0;
     enabledExts[enabledCount++] = XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME;
     enabledExts[enabledCount++] = XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME;
@@ -968,6 +975,14 @@ static int initXrInstance(XrCtx* ctx) {
     }
     if (ctx->msftHandInteraction) {
         enabledExts[enabledCount++] = XR_MSFT_HAND_INTERACTION_EXTENSION_NAME;
+    }
+    // The system menu gesture on tracked hands, Meta runtimes only. It
+    // rides on the hand tracking locate call, so it needs that too.
+    if (ctx->fbAim && ctx->handTracking) {
+        enabledExts[enabledCount++] = XR_FB_HAND_TRACKING_AIM_EXTENSION_NAME;
+    }
+    else {
+        ctx->fbAim = 0;
     }
 
     XrInstanceCreateInfoAndroidKHR androidInfo = { XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR };
@@ -1755,6 +1770,15 @@ static void suggestBindings(XrCtx* ctx, const char* profile, int full) {
         b[n].action = ctx->triggerAction;
         b[n++].binding = toPath(ctx, path);
 
+        // The menu button opens the environment picker. Left hand only:
+        // that is the hand it is on for touch and pico4, and a subset of
+        // the paths is a valid suggestion for the simple profile too.
+        if (full && h == HAND_LEFT && ctx->menuAction != XR_NULL_HANDLE) {
+            snprintf(path, sizeof(path), "%s/input/menu/click", hands[h]);
+            b[n].action = ctx->menuAction;
+            b[n++].binding = toPath(ctx, path);
+        }
+
         if (!full || simple) {
             continue;
         }
@@ -1886,6 +1910,7 @@ static int initXrInput(XrCtx* ctx) {
     ctx->scrollAction = makeAction(ctx, XR_ACTION_TYPE_VECTOR2F_INPUT, "scroll", "Scroll");
     ctx->grabAction = makeAction(ctx, XR_ACTION_TYPE_FLOAT_INPUT, "grab", "Move the screen");
     ctx->toggleAction = makeAction(ctx, XR_ACTION_TYPE_BOOLEAN_INPUT, "pointertoggle", "Pointer on or off");
+    ctx->menuAction = makeAction(ctx, XR_ACTION_TYPE_BOOLEAN_INPUT, "menu", "Environment menu");
 
     if (ctx->aimAction == XR_NULL_HANDLE || ctx->triggerAction == XR_NULL_HANDLE) {
         return 0;
@@ -2147,6 +2172,7 @@ static int jointPinching(XrCtx* ctx, int hand, XrSpace space, const XrPosef* hea
                          int headValid) {
     if (!ctx->jointTracking || ctx->handTrackers[hand] == XR_NULL_HANDLE) {
         ctx->handRayValid[hand] = 0;
+        ctx->aimMenuPressed[hand] = 0;
         return 0;
     }
 
@@ -2154,6 +2180,12 @@ static int jointPinching(XrCtx* ctx, int hand, XrSpace space, const XrPosef* hea
     XrHandJointLocationsEXT locations = { XR_TYPE_HAND_JOINT_LOCATIONS_EXT };
     locations.jointCount = XR_HAND_JOINT_COUNT_EXT;
     locations.jointLocations = joints;
+
+    // The system menu gesture rides along with the joints on Meta runtimes
+    XrHandTrackingAimStateFB aimState = { XR_TYPE_HAND_TRACKING_AIM_STATE_FB };
+    if (ctx->fbAim) {
+        locations.next = &aimState;
+    }
 
     XrHandJointsLocateInfoEXT locate = { XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT };
     locate.baseSpace = space;
@@ -2163,8 +2195,12 @@ static int jointPinching(XrCtx* ctx, int hand, XrSpace space, const XrPosef* hea
         ctx->jointPinch[hand] = 0;
         ctx->pinchPointValid[hand] = 0;
         ctx->handRayValid[hand] = 0;
+        ctx->aimMenuPressed[hand] = 0;
         return 0;
     }
+
+    ctx->aimMenuPressed[hand] = ctx->fbAim
+            && (aimState.status & XR_HAND_TRACKING_AIM_MENU_PRESSED_BIT_FB) != 0;
 
     if (headValid) {
         buildHandRay(ctx, hand, head, joints);
@@ -2975,8 +3011,8 @@ Java_com_limelight_binding_video_XrRenderer_nativeInit(JNIEnv* env, jobject thiz
         LOGW("pointer swapchain unavailable, the ray will not be drawn");
     }
 
-    LOGI("OpenXR init complete (cylinder=%d equirect=%d srgbWriteControl=%d)",
-         ctx->cylinderSupported, ctx->equirectSupported, ctx->srgbWriteControl);
+    LOGI("OpenXR init complete (cylinder=%d equirect=%d srgbWriteControl=%d handMenu=%d)",
+         ctx->cylinderSupported, ctx->equirectSupported, ctx->srgbWriteControl, ctx->fbAim);
     return (jlong)(intptr_t)ctx;
 }
 
@@ -3541,6 +3577,24 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
             ctx->pointerAwake = 0;
         }
     }
+
+    // A menu press toggles the environment picker: the left controller
+    // menu button, or on tracked hands the system menu gesture (a quick
+    // pinch on the shown left palm), which XR_FB_hand_tracking_aim
+    // reports beside the joints. Runtimes with neither still reach the
+    // picker through the button under the screen.
+    int menuNow = actionBool(ctx, ctx->menuAction, HAND_LEFT)
+            || ctx->aimMenuPressed[HAND_LEFT] || ctx->aimMenuPressed[HAND_RIGHT];
+    if (menuNow && !ctx->menuPrev) {
+        ctx->pickerOpen = !ctx->pickerOpen;
+        // The picker needs an awake pointer to be aimed at, and the pinch
+        // that carried the gesture must not also count as a click on it
+        ctx->pointerAwake = 1;
+        for (int h = 0; h < SRC_COUNT; h++) {
+            ctx->triggerEdge[h] = 0;
+        }
+    }
+    ctx->menuPrev = menuNow;
 
     // The hand holding the trigger wins, so a drag is never stolen by the other
     // one drifting across the screen. Right hand otherwise.
