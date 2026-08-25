@@ -412,6 +412,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 glPrefs.glRenderer,
                 this);
 
+        // Hydra: body host and route for the VR diagnostics panel
+        decoderRenderer.setHydraStreamInfo(host, hydraRemoteTuned);
+
         // Don't stream HDR if the decoder can't support it
         if (willStreamHdr && !decoderRenderer.isHevcMain10Hdr10Supported() && !decoderRenderer.isAv1Main10Supported()) {
             willStreamHdr = false;

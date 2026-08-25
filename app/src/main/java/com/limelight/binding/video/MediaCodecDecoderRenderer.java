@@ -516,6 +516,55 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         return xrRenderer;
     }
 
+    // Hydra: which body this stream comes from and over which route
+    // ("mesh" or "lan"). Game sets them from the launch intent extras, the
+    // VR diagnostics panel displays them.
+    private String hydraHost;
+    private String hydraRoute;
+
+    public void setHydraStreamInfo(String host, boolean meshRouted) {
+        this.hydraHost = host;
+        this.hydraRoute = meshRouted ? "mesh" : "lan";
+    }
+
+    // Hydra: the structured twin of the perf overlay string, for the VR
+    // diagnostics panel. Guarded division throughout: a window with no
+    // frames yet must show placeholders, not NaN.
+    private StreamDiagnostics buildDiagnostics(VideoStats lastTwo, VideoStatsFps fps,
+                                               String decoderName, long rttInfo) {
+        StreamDiagnostics d = new StreamDiagnostics();
+        d.rttMs = (int)(rttInfo >> 32);
+        d.rttVarianceMs = (int)rttInfo;
+        d.incomingFps = fps.receivedFps;
+        d.renderedFps = fps.renderedFps;
+        d.netDropPercent = lastTwo.totalFrames > 0
+                ? (float)lastTwo.framesLost / lastTwo.totalFrames * 100 : 0.0f;
+        d.hasHostLatency = lastTwo.framesWithHostProcessingLatency > 0;
+        if (d.hasHostLatency) {
+            d.hostLatencyMinMs = (float)lastTwo.minHostProcessingLatency / 10;
+            d.hostLatencyMaxMs = (float)lastTwo.maxHostProcessingLatency / 10;
+            d.hostLatencyAvgMs = (float)lastTwo.totalHostProcessingLatency / 10
+                    / lastTwo.framesWithHostProcessingLatency;
+        }
+        d.decodeTimeMs = lastTwo.totalFramesReceived > 0
+                ? (float)lastTwo.decoderTimeMs / lastTwo.totalFramesReceived : -1.0f;
+        if ((videoFormat & MoonBridge.VIDEO_FORMAT_MASK_H264) != 0) {
+            d.codec = "H.264";
+        } else if ((videoFormat & MoonBridge.VIDEO_FORMAT_MASK_H265) != 0) {
+            d.codec = "HEVC";
+        } else if ((videoFormat & MoonBridge.VIDEO_FORMAT_MASK_AV1) != 0) {
+            d.codec = "AV1";
+        }
+        d.decoderName = decoderName;
+        d.width = initialWidth;
+        d.height = initialHeight;
+        d.targetFps = prefs.fps;
+        d.bitrateKbps = prefs.bitrate;
+        d.bodyHost = hydraHost;
+        d.route = hydraRoute;
+        return d;
+    }
+
     // The connection starts on its own thread, so the activity can be gone by
     // the time the codec asks for a surface. A session created for a dead
     // activity never leaves IDLE, and since nothing tears it down it wedges
@@ -1510,7 +1559,14 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         // Flip stats windows roughly every second
         if (SystemClock.uptimeMillis() >= activeWindowVideoStats.measurementStartTimestamp + 1000) {
-            if (prefs.enablePerfOverlay) {
+            // Hydra: the VR diagnostics panel consumes the same numbers as
+            // the perf overlay, structured instead of formatted, and only
+            // while the user has it open. The aggregation above runs
+            // unconditionally either way, so neither consumer adds cost to
+            // the other.
+            XrRenderer diagRenderer = xrRenderer;
+            boolean wantDiagnostics = diagRenderer != null && diagRenderer.isDiagnosticsVisible();
+            if (prefs.enablePerfOverlay || wantDiagnostics) {
                 VideoStats lastTwo = new VideoStats();
                 lastTwo.add(lastWindowVideoStats);
                 lastTwo.add(activeWindowVideoStats);
@@ -1529,25 +1585,33 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
                 float decodeTimeMs = (float)lastTwo.decoderTimeMs / lastTwo.totalFramesReceived;
                 long rttInfo = MoonBridge.getEstimatedRttInfo();
-                StringBuilder sb = new StringBuilder();
-                sb.append(context.getString(R.string.perf_overlay_streamdetails, initialWidth + "x" + initialHeight, fps.totalFps)).append('\n');
-                sb.append(context.getString(R.string.perf_overlay_decoder, decoder)).append('\n');
-                sb.append(context.getString(R.string.perf_overlay_incomingfps, fps.receivedFps)).append('\n');
-                sb.append(context.getString(R.string.perf_overlay_renderingfps, fps.renderedFps)).append('\n');
-                sb.append(context.getString(R.string.perf_overlay_netdrops,
-                        (float)lastTwo.framesLost / lastTwo.totalFrames * 100)).append('\n');
-                sb.append(context.getString(R.string.perf_overlay_netlatency,
-                        (int)(rttInfo >> 32), (int)rttInfo)).append('\n');
-                if (lastTwo.framesWithHostProcessingLatency > 0) {
-                    sb.append(context.getString(R.string.perf_overlay_hostprocessinglatency,
-                            (float)lastTwo.minHostProcessingLatency / 10,
-                            (float)lastTwo.maxHostProcessingLatency / 10,
-                            (float)lastTwo.totalHostProcessingLatency / 10 / lastTwo.framesWithHostProcessingLatency)).append('\n');
+
+                if (prefs.enablePerfOverlay) {
+                    StringBuilder sb = new StringBuilder();
+                    sb.append(context.getString(R.string.perf_overlay_streamdetails, initialWidth + "x" + initialHeight, fps.totalFps)).append('\n');
+                    sb.append(context.getString(R.string.perf_overlay_decoder, decoder)).append('\n');
+                    sb.append(context.getString(R.string.perf_overlay_incomingfps, fps.receivedFps)).append('\n');
+                    sb.append(context.getString(R.string.perf_overlay_renderingfps, fps.renderedFps)).append('\n');
+                    sb.append(context.getString(R.string.perf_overlay_netdrops,
+                            (float)lastTwo.framesLost / lastTwo.totalFrames * 100)).append('\n');
+                    sb.append(context.getString(R.string.perf_overlay_netlatency,
+                            (int)(rttInfo >> 32), (int)rttInfo)).append('\n');
+                    if (lastTwo.framesWithHostProcessingLatency > 0) {
+                        sb.append(context.getString(R.string.perf_overlay_hostprocessinglatency,
+                                (float)lastTwo.minHostProcessingLatency / 10,
+                                (float)lastTwo.maxHostProcessingLatency / 10,
+                                (float)lastTwo.totalHostProcessingLatency / 10 / lastTwo.framesWithHostProcessingLatency)).append('\n');
+                    }
+                    sb.append(context.getString(R.string.perf_overlay_dectime, decodeTimeMs));
+                    // Also goes to logcat so stats can be read over adb
+                    LimeLog.info("Perf overlay: " + sb.toString().replace('\n', ';'));
+                    perfListener.onPerfUpdate(sb.toString());
                 }
-                sb.append(context.getString(R.string.perf_overlay_dectime, decodeTimeMs));
-                // Also goes to logcat so stats can be read over adb
-                LimeLog.info("Perf overlay: " + sb.toString().replace('\n', ';'));
-                perfListener.onPerfUpdate(sb.toString());
+
+                if (wantDiagnostics) {
+                    diagRenderer.updateDiagnostics(
+                            buildDiagnostics(lastTwo, fps, decoder, rttInfo));
+                }
             }
 
             globalVideoStats.add(activeWindowVideoStats);

@@ -103,6 +103,9 @@
 #define IN_PICKER_PICK 17
 // Set to 1 on the frame the exit button is clicked. Java ends the stream.
 #define IN_EXIT     18
+// 1 while the diagnostics panel is open. Java only draws and uploads the
+// panel bitmap while this reads 1, so a hidden panel costs nothing.
+#define IN_DIAG     19
 #define IN_SLOTS    20
 
 // Grab thresholds for the grip, and the range a resize is allowed to reach
@@ -162,6 +165,19 @@
 // The exit button, mirrored on the right of the move bar. Clicking it ends
 // the stream, which is the only way out for a user with no controllers.
 #define HOVER_EXITBUTTON 7
+// The diagnostics button, one slot further left than the environment
+// button. Clicking it toggles the stream diagnostics panel.
+#define HOVER_DIAGBUTTON 8
+
+// Stream diagnostics panel, drawn as a Bitmap in Java and composed as a
+// quad beside the left edge of the screen, angled toward the viewer so it
+// reads without covering the picture.
+#define DIAG_TEX_W 512
+#define DIAG_TEX_H 640
+#define DIAG_WIDTH_FRAC 0.35f
+#define DIAG_GAP_FRAC 0.04f
+// Yaw toward the viewer, about 20 degrees
+#define DIAG_ANGLE_RAD 0.35f
 
 // Hand presence layer. Joints drawn as soft translucent dots into the one
 // projection layer this renderer owns. Half the recommended eye resolution
@@ -579,6 +595,20 @@ typedef struct {
     XrSwapchainImageOpenGLESKHR* exitButtonImages;
     int exitButtonReady;
     int exitButtonHot;
+
+    // The diagnostics button, left of the environment button, and the
+    // panel it toggles: stream stats drawn in Java, shown beside the
+    // screen while open.
+    XrSwapchain diagButtonSwapchain;
+    uint32_t diagButtonImageCount;
+    XrSwapchainImageOpenGLESKHR* diagButtonImages;
+    int diagButtonReady;
+    int diagButtonHot;
+    XrSwapchain diagSwapchain;
+    uint32_t diagImageCount;
+    XrSwapchainImageOpenGLESKHR* diagImages;
+    int diagReady;
+    int diagOpen;
 
     // Hand presence: joints drawn as translucent dots. The one projection
     // layer in the renderer; everything else is composed by the compositor.
@@ -2503,6 +2533,40 @@ static int createPointerSwapchain(XrCtx* ctx) {
         ctx->exitButtonSwapchain = XR_NULL_HANDLE;
     }
 
+    // Same square art size again for the diagnostics button
+    if (checkXr(xrCreateSwapchain(ctx->session, &info, &ctx->diagButtonSwapchain),
+                "create diag button swapchain")) {
+        xrEnumerateSwapchainImages(ctx->diagButtonSwapchain, 0, &ctx->diagButtonImageCount, NULL);
+        ctx->diagButtonImages = calloc(ctx->diagButtonImageCount,
+                                       sizeof(XrSwapchainImageOpenGLESKHR));
+        for (uint32_t i = 0; i < ctx->diagButtonImageCount; i++) {
+            ctx->diagButtonImages[i].type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR;
+        }
+        xrEnumerateSwapchainImages(ctx->diagButtonSwapchain, ctx->diagButtonImageCount,
+                                   &ctx->diagButtonImageCount,
+                                   (XrSwapchainImageBaseHeader*)ctx->diagButtonImages);
+    }
+    else {
+        ctx->diagButtonSwapchain = XR_NULL_HANDLE;
+    }
+
+    info.width = DIAG_TEX_W;
+    info.height = DIAG_TEX_H;
+    if (checkXr(xrCreateSwapchain(ctx->session, &info, &ctx->diagSwapchain),
+                "create diag swapchain")) {
+        xrEnumerateSwapchainImages(ctx->diagSwapchain, 0, &ctx->diagImageCount, NULL);
+        ctx->diagImages = calloc(ctx->diagImageCount, sizeof(XrSwapchainImageOpenGLESKHR));
+        for (uint32_t i = 0; i < ctx->diagImageCount; i++) {
+            ctx->diagImages[i].type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR;
+        }
+        xrEnumerateSwapchainImages(ctx->diagSwapchain, ctx->diagImageCount,
+                                   &ctx->diagImageCount,
+                                   (XrSwapchainImageBaseHeader*)ctx->diagImages);
+    }
+    else {
+        ctx->diagSwapchain = XR_NULL_HANDLE;
+    }
+
     info.width = CORNER_TEX_W;
     info.height = CORNER_TEX_H;
     if (checkXr(xrCreateSwapchain(ctx->session, &info, &ctx->cornerSwapchain),
@@ -2973,6 +3037,25 @@ static int exitButtonHit(XrCtx* ctx, float u, float v, float height) {
     return fabsf(u - cu) < halfU && fabsf(v - cv) < halfV;
 }
 
+// The diagnostics button sits one slot further left than the environment
+// button, so the row reads diagnostics, environments, bar, exit
+static void diagButtonPlacement(XrCtx* ctx, float height, Vec3* outLocal, float* outSide) {
+    envButtonPlacement(ctx, height, outLocal, outSide);
+    outLocal->x -= *outSide + ctx->screenWidth * ENV_GAP_FRAC;
+}
+
+static int diagButtonHit(XrCtx* ctx, float u, float v, float height) {
+    Vec3 local;
+    float side;
+    diagButtonPlacement(ctx, height, &local, &side);
+
+    float cu = 0.5f + local.x / ctx->screenWidth;
+    float cv = 0.5f - local.y / height;
+    float halfU = side * HOVER_MARGIN * 0.5f / ctx->screenWidth;
+    float halfV = side * HOVER_MARGIN * 0.5f / height;
+    return fabsf(u - cu) < halfU && fabsf(v - cv) < halfV;
+}
+
 // Where the ray lands on furniture rather than on the picture. The grid has a
 // plane of its own, everything else sits on the screen.
 static Vec3 furniturePoint(XrCtx* ctx, int hover, float u, float v, XrPosef screenPose,
@@ -3058,6 +3141,14 @@ static void destroyCtx(JNIEnv* env, XrCtx* ctx) {
         xrDestroySwapchain(ctx->exitButtonSwapchain);
     }
     free(ctx->exitButtonImages);
+    if (ctx->diagButtonSwapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(ctx->diagButtonSwapchain);
+    }
+    free(ctx->diagButtonImages);
+    if (ctx->diagSwapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(ctx->diagSwapchain);
+    }
+    free(ctx->diagImages);
     if (ctx->foveationProfile != XR_NULL_HANDLE && ctx->pfnDestroyFoveationProfile != NULL) {
         ctx->pfnDestroyFoveationProfile(ctx->foveationProfile);
     }
@@ -3524,6 +3615,9 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
     // Zero is a real cell, so "nothing picked" has to be said explicitly. Every
     // early return below would otherwise read as a press on the first one.
     out[IN_PICKER_PICK] = -1.0f;
+    // Carried on every path, so Java always knows whether the diagnostics
+    // panel wants bitmaps
+    out[IN_DIAG] = (ctx != NULL && ctx->diagOpen) ? 1.0f : 0.0f;
 
     // Anything held has to come back up when pointing stops, or the host is
     // left with a stuck button
@@ -3645,6 +3739,10 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
             if ((hovers[h] == HOVER_NONE || hovers[h] == HOVER_BAR)
                     && exitButtonHit(ctx, hitU[h], hitV[h], height)) {
                 hovers[h] = HOVER_EXITBUTTON;
+            }
+            if ((hovers[h] == HOVER_NONE || hovers[h] == HOVER_BAR)
+                    && diagButtonHit(ctx, hitU[h], hitV[h], height)) {
+                hovers[h] = HOVER_DIAGBUTTON;
             }
         }
 
@@ -3797,6 +3895,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
     ctx->pickerHover = -1;
     ctx->envButtonHot = 0;
     ctx->exitButtonHot = 0;
+    ctx->diagButtonHot = 0;
     ctx->pickerPick = -1;
     if (ctx->pickerOpen) {
         hover = HOVER_PICKER;
@@ -3855,6 +3954,16 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
             // Java ends the stream. Reported once, on the click edge.
             LOGI("exit button clicked");
             out[IN_EXIT] = 1.0f;
+        }
+    }
+    else if (hover == HOVER_DIAGBUTTON) {
+        ctx->diagButtonHot = 1;
+        if (ctx->triggerEdge[hand]) {
+            ctx->diagOpen = !ctx->diagOpen;
+            // Reported this frame rather than next, so Java can start
+            // drawing without waiting a frame
+            out[IN_DIAG] = ctx->diagOpen ? 1.0f : 0.0f;
+            LOGI("diagnostics panel %s", ctx->diagOpen ? "opened" : "closed");
         }
     }
 
@@ -4449,7 +4558,8 @@ static void renderVideoFrame(XrCtx* ctx, const float* texMatrix, float separatio
 JNIEXPORT void JNICALL
 Java_com_limelight_binding_video_XrRenderer_nativeUploadPicker(JNIEnv* env, jobject thiz,
                                                                jlong handle, jobject grid,
-                                                               jobject button, jobject exit) {
+                                                               jobject button, jobject exit,
+                                                               jobject diag) {
     XrCtx* ctx = (XrCtx*)(intptr_t)handle;
     if (ctx == NULL) {
         return;
@@ -4477,9 +4587,35 @@ Java_com_limelight_binding_video_XrRenderer_nativeUploadPicker(JNIEnv* env, jobj
                                                  OUTLINE_TEX, OUTLINE_TEX);
         }
     }
-    LOGI("picker art %s, button %s, exit %s", ctx->pickerReady ? "ready" : "missing",
+    if (diag != NULL) {
+        const unsigned char* px = (*env)->GetDirectBufferAddress(env, diag);
+        if (px != NULL) {
+            ctx->diagButtonReady = uploadFlipped(ctx, ctx->diagButtonSwapchain,
+                                                 ctx->diagButtonImages, px,
+                                                 OUTLINE_TEX, OUTLINE_TEX);
+        }
+    }
+    LOGI("picker art %s, button %s, exit %s, diag %s", ctx->pickerReady ? "ready" : "missing",
          ctx->envButtonReady ? "ready" : "missing",
-         ctx->exitButtonReady ? "ready" : "missing");
+         ctx->exitButtonReady ? "ready" : "missing",
+         ctx->diagButtonReady ? "ready" : "missing");
+}
+
+// The diagnostics panel, drawn as a Bitmap in Java once a second while it
+// is open. Flipped on the way in like the rest of the Bitmap art, and
+// uploaded from the frame loop so the GL context is current.
+JNIEXPORT void JNICALL
+Java_com_limelight_binding_video_XrRenderer_nativeUploadDiagnostics(JNIEnv* env, jobject thiz,
+                                                                    jlong handle, jobject panel) {
+    XrCtx* ctx = (XrCtx*)(intptr_t)handle;
+    if (ctx == NULL || panel == NULL) {
+        return;
+    }
+    const unsigned char* px = (*env)->GetDirectBufferAddress(env, panel);
+    if (px != NULL) {
+        ctx->diagReady = uploadFlipped(ctx, ctx->diagSwapchain, ctx->diagImages,
+                                       px, DIAG_TEX_W, DIAG_TEX_H);
+    }
 }
 
 // Which cell the picker is showing as chosen, so it survives a restart
@@ -5066,11 +5202,13 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
     XrCompositionLayerQuad handleLayer;
     XrCompositionLayerQuad envButtonLayer;
     XrCompositionLayerQuad exitButtonLayer;
+    XrCompositionLayerQuad diagButtonLayer;
+    XrCompositionLayerQuad diagLayer;
     XrCompositionLayerQuad pickerLayer;
     XrCompositionLayerQuad outlineLayers[2];
     XrCompositionLayerProjection handLayer;
     XrCompositionLayerProjectionView handLayerViews[2];
-    const XrCompositionLayerBaseHeader* layers[16];
+    const XrCompositionLayerBaseHeader* layers[18];
     uint32_t layerCount = 0;
 
     // Submitted first so everything else sits in front of it. Passthrough wants
@@ -5198,7 +5336,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
         // The bar and the two buttons beside it share a hover area, so
         // reaching for one keeps the others on screen rather than swapping
         int barArea = ctx->hoverKind == HOVER_BAR || ctx->hoverKind == HOVER_ENVBUTTON
-                || ctx->hoverKind == HOVER_EXITBUTTON;
+                || ctx->hoverKind == HOVER_EXITBUTTON || ctx->hoverKind == HOVER_DIAGBUTTON;
 
         // Move bar and resize corner, shown only while the ray is over them.
         // Both live in the screen's own frame, so they travel with it.
@@ -5311,6 +5449,67 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
             exitButtonLayer.size.width = side * exitScale;
             exitButtonLayer.size.height = side * exitScale;
             layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&exitButtonLayer;
+        }
+
+        // The diagnostics button, left of the environment button. Stays up
+        // while the panel is open so it reads as the thing that opened it.
+        if (ctx->diagButtonReady && (barArea || ctx->pickerOpen || ctx->diagOpen)) {
+            Vec3 local;
+            float side;
+            diagButtonPlacement(ctx, screenHeight, &local, &side);
+            Vec3 offset = quatRotate(screenPose.orientation, local);
+
+            memset(&diagButtonLayer, 0, sizeof(diagButtonLayer));
+            diagButtonLayer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+            diagButtonLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            diagButtonLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            diagButtonLayer.subImage.swapchain = ctx->diagButtonSwapchain;
+            diagButtonLayer.subImage.imageRect.offset.x = 0;
+            diagButtonLayer.subImage.imageRect.offset.y = 0;
+            diagButtonLayer.subImage.imageRect.extent.width = OUTLINE_TEX;
+            diagButtonLayer.subImage.imageRect.extent.height = OUTLINE_TEX;
+            diagButtonLayer.subImage.imageArrayIndex = 0;
+            diagButtonLayer.space = space;
+            diagButtonLayer.pose.orientation = screenPose.orientation;
+            diagButtonLayer.pose.position.x = screenPose.position.x + offset.x;
+            diagButtonLayer.pose.position.y = screenPose.position.y + offset.y;
+            diagButtonLayer.pose.position.z = screenPose.position.z + offset.z;
+            float diagScale = ctx->diagButtonHot ? 1.18f : 1.0f;
+            diagButtonLayer.size.width = side * diagScale;
+            diagButtonLayer.size.height = side * diagScale;
+            layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&diagButtonLayer;
+        }
+
+        // The diagnostics panel, beside the left edge of the screen and
+        // yawed a little toward the viewer, so it never covers the picture
+        if (ctx->diagOpen && ctx->diagReady && ctx->diagSwapchain != XR_NULL_HANDLE) {
+            float diagW = screenWidth * DIAG_WIDTH_FRAC;
+            float diagH = diagW * (float)DIAG_TEX_H / (float)DIAG_TEX_W;
+
+            Vec3 local = { -(screenWidth * (0.5f + DIAG_GAP_FRAC) + diagW * 0.5f),
+                           0.0f, 0.02f };
+            Vec3 offset = quatRotate(screenPose.orientation, local);
+            XrQuaternionf yawQ = { 0.0f, sinf(DIAG_ANGLE_RAD * 0.5f), 0.0f,
+                                   cosf(DIAG_ANGLE_RAD * 0.5f) };
+
+            memset(&diagLayer, 0, sizeof(diagLayer));
+            diagLayer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+            diagLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            diagLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            diagLayer.subImage.swapchain = ctx->diagSwapchain;
+            diagLayer.subImage.imageRect.offset.x = 0;
+            diagLayer.subImage.imageRect.offset.y = 0;
+            diagLayer.subImage.imageRect.extent.width = DIAG_TEX_W;
+            diagLayer.subImage.imageRect.extent.height = DIAG_TEX_H;
+            diagLayer.subImage.imageArrayIndex = 0;
+            diagLayer.space = space;
+            diagLayer.pose.orientation = quatNorm(quatMul(screenPose.orientation, yawQ));
+            diagLayer.pose.position.x = screenPose.position.x + offset.x;
+            diagLayer.pose.position.y = screenPose.position.y + offset.y;
+            diagLayer.pose.position.z = screenPose.position.z + offset.z;
+            diagLayer.size.width = diagW;
+            diagLayer.size.height = diagH;
+            layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&diagLayer;
         }
 
         // The environment grid, floating in front of the screen, with the

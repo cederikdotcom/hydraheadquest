@@ -83,6 +83,13 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
     /** The one active operator overlay (PIN, menu, diagnostics, WG, ...). */
     private var overlayView: View? = null
 
+    /**
+     * The sequenced diagnostics run behind the operator Diagnostics view
+     * (iPad DiagnosticsRunner parity). Activity-scoped so a finished
+     * run's summary can ride along in the issue report.
+     */
+    private val diagnosticsRunner by lazy { HydraDiagnosticsRunner(this) }
+
     // WireGuard panel views, set while that overlay is showing.
     private var wgStatusView: TextView? = null
     private var wgHandshakeView: TextView? = null
@@ -542,11 +549,122 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
         panelButton(column, "Close", primary = true) { dismissOverlay() }
     }
 
-    /** Two-column key/value diagnostics panel with big readable text. */
+    /**
+     * Diagnostics panel: the sequenced 5-step check run (iPad
+     * DiagnosticsView parity, via [HydraDiagnosticsRunner]) above the
+     * static heartbeat key/value table. The run button starts the steps;
+     * each row shows a spinner while running and a green check or red
+     * cross with a detail line when done, then a verdict line sums up.
+     * Re-runnable. A finished run's summary rides along in the issue
+     * report.
+     */
     private fun showDiagnostics() {
         val column = showOverlayPanel(720)
         column.addView(HydraUi.title(this, "Diagnostics"))
 
+        val shownOverlay = overlayView
+
+        // --- Sequenced check run ---
+        var runButton: Button? = null
+        val stepsCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = HydraUi.card(this@HydraCatalogActivity, HydraUi.COLOR_SURFACE)
+            setPadding(dp(HydraUi.SPACE_S), dp(8), dp(HydraUi.SPACE_S), dp(8))
+            visibility = View.GONE
+        }
+        val verdictView = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_BODY))
+            typeface = Typeface.DEFAULT_BOLD
+            visibility = View.GONE
+        }
+
+        fun renderSteps(steps: List<HydraDiagnosticsRunner.Step>) {
+            stepsCard.visibility = View.VISIBLE
+            stepsCard.removeAllViews()
+            for (step in steps) {
+                stepsCard.addView(makeStepRow(step))
+            }
+        }
+
+        fun renderVerdict(steps: List<HydraDiagnosticsRunner.Step>) {
+            val failed = steps.count {
+                it.status == HydraDiagnosticsRunner.Status.FAILED
+            }
+            verdictView.visibility = View.VISIBLE
+            if (failed == 0) {
+                verdictView.text = "All checks passed"
+                verdictView.setTextColor(HydraUi.COLOR_GREEN)
+            } else {
+                verdictView.text =
+                    if (failed == 1) "1 check failed" else "$failed checks failed"
+                verdictView.setTextColor(HydraUi.COLOR_RED)
+            }
+        }
+
+        val runBtn = HydraUi.bigButton(this, "Run diagnostics", primary = true) {
+            if (diagnosticsRunner.run()) {
+                verdictView.visibility = View.GONE
+                runButton?.isEnabled = false
+                runButton?.text = "Running..."
+            }
+        }
+        runButton = runBtn
+        column.addView(
+            runBtn,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(HydraUi.SPACE_M) }
+        )
+        column.addView(
+            stepsCard,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(HydraUi.SPACE_S) }
+        )
+        column.addView(
+            verdictView,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(HydraUi.SPACE_S) }
+        )
+
+        // Callbacks arrive on the runner thread; the overlay identity
+        // check drops updates for a dismissed or replaced panel.
+        diagnosticsRunner.listener = object : HydraDiagnosticsRunner.Listener {
+            override fun onStepsChanged(steps: List<HydraDiagnosticsRunner.Step>) {
+                runOnUiThread {
+                    if (overlayView !== shownOverlay) return@runOnUiThread
+                    renderSteps(steps)
+                }
+            }
+
+            override fun onRunFinished(steps: List<HydraDiagnosticsRunner.Step>) {
+                runOnUiThread {
+                    if (overlayView !== shownOverlay) return@runOnUiThread
+                    renderSteps(steps)
+                    renderVerdict(steps)
+                    runButton?.isEnabled = true
+                    runButton?.text = "Run again"
+                }
+            }
+        }
+
+        // Panel reopened while a run is in flight, or after one finished:
+        // show what the runner already has.
+        if (diagnosticsRunner.isRunning()) {
+            renderSteps(diagnosticsRunner.snapshot())
+            runBtn.isEnabled = false
+            runBtn.text = "Running..."
+        } else if (diagnosticsRunner.summaryOrNull() != null) {
+            renderSteps(diagnosticsRunner.snapshot())
+            renderVerdict(diagnosticsRunner.snapshot())
+            runBtn.text = "Run again"
+        }
+
+        // --- Static heartbeat table (unchanged) ---
         val table = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = HydraUi.card(this@HydraCatalogActivity, HydraUi.COLOR_SURFACE)
@@ -564,7 +682,6 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
 
         // Collect off the main thread: the latency probe blocks up to 5 s.
         var lastReport = "Collecting diagnostics..."
-        val shownOverlay = overlayView
         thread(name = "HydraDiag") {
             val pairs = diagnosticsPairs()
             lastReport = pairs.joinToString("\n") { "${it.first}: ${it.second}" }
@@ -577,9 +694,105 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
             }
         }
 
-        panelButton(column, "Report issue") { fileIssue(lastReport) }
+        panelButton(column, "Report issue") {
+            // Append the last finished run so the tracker sees both the
+            // heartbeat fields and the step results.
+            val summary = diagnosticsRunner.summaryOrNull()
+            val report = if (summary == null) {
+                lastReport
+            } else {
+                lastReport + "\n\nDiagnostics run:\n" + summary
+            }
+            fileIssue(report)
+        }
         panelButton(column, "Back") { showOperatorMenu() }
         panelButton(column, "Close", primary = true) { dismissOverlay() }
+    }
+
+    /** One check row: state icon, label, optional detail line. */
+    private fun makeStepRow(step: HydraDiagnosticsRunner.Step): View {
+        val iconSlot = FrameLayout(this)
+        val iconParams = FrameLayout.LayoutParams(dp(28), dp(28), Gravity.CENTER)
+        if (step.status == HydraDiagnosticsRunner.Status.RUNNING) {
+            iconSlot.addView(
+                ProgressBar(this).apply { isIndeterminate = true },
+                iconParams
+            )
+        } else {
+            val glyph: String
+            val color: Int
+            when (step.status) {
+                HydraDiagnosticsRunner.Status.PASSED -> {
+                    glyph = "✓"
+                    color = HydraUi.COLOR_GREEN
+                }
+                HydraDiagnosticsRunner.Status.FAILED -> {
+                    glyph = "✕"
+                    color = HydraUi.COLOR_RED
+                }
+                HydraDiagnosticsRunner.Status.SKIPPED -> {
+                    glyph = "-"
+                    color = HydraUi.COLOR_TEXT_FAINT
+                }
+                else -> {
+                    glyph = "○"
+                    color = HydraUi.COLOR_TEXT_FAINT
+                }
+            }
+            iconSlot.addView(
+                TextView(this).apply {
+                    text = glyph
+                    gravity = Gravity.CENTER
+                    setTextColor(color)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_BUTTON))
+                    typeface = Typeface.DEFAULT_BOLD
+                },
+                iconParams
+            )
+        }
+
+        val labelColor = when (step.status) {
+            HydraDiagnosticsRunner.Status.FAILED -> HydraUi.COLOR_RED
+            HydraDiagnosticsRunner.Status.SKIPPED -> HydraUi.COLOR_TEXT_FAINT
+            else -> HydraUi.COLOR_TEXT
+        }
+        val textColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(
+                TextView(this@HydraCatalogActivity).apply {
+                    text = step.label
+                    setTextColor(labelColor)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_BODY))
+                }
+            )
+            if (step.detail.isNotEmpty()) {
+                addView(
+                    TextView(this@HydraCatalogActivity).apply {
+                        text = step.detail
+                        setTextColor(HydraUi.COLOR_TEXT_DIM)
+                        setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_CAPTION))
+                    }
+                )
+            }
+        }
+
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+            addView(
+                iconSlot,
+                LinearLayout.LayoutParams(dp(36), dp(36)).apply {
+                    rightMargin = dp(HydraUi.SPACE_S)
+                }
+            )
+            addView(
+                textColumn,
+                LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
+                )
+            )
+        }
     }
 
     private fun makeDiagnosticsRow(key: String, value: String): View {

@@ -20,6 +20,7 @@ import android.view.Surface;
 
 import com.limelight.LimeLog;
 import com.limelight.hydra.HydraAmbient;
+import com.limelight.hydra.HydraUi;
 import com.limelight.preferences.PreferenceConfiguration;
 
 import java.io.File;
@@ -118,6 +119,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     private static final int IN_POSE = 8;
     private static final int IN_PICKER_PICK = 17;
     private static final int IN_EXIT = 18;
+    private static final int IN_DIAG = 19;
     private static final int IN_SLOTS = 20;
     private static final int POSE_VALUES = 9;
     private final float[] inputState = new float[IN_SLOTS];
@@ -154,6 +156,24 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     private final AtomicReference<ByteBuffer> pendingPickerArt = new AtomicReference<>();
     private final AtomicReference<ByteBuffer> pendingEnvButton = new AtomicReference<>();
     private final AtomicReference<ByteBuffer> pendingExitButton = new AtomicReference<>();
+    private final AtomicReference<ByteBuffer> pendingDiagButton = new AtomicReference<>();
+
+    // Stream diagnostics panel, iPad-app parity. The decoder fills a
+    // StreamDiagnostics about once a second while the panel is open, this
+    // side draws it as a dark card and the frame loop uploads it. Same
+    // two-buffer handoff as the stats overlay. Matches DIAG_TEX_W/H in
+    // xr_renderer.c.
+    private static final int DIAG_TEX_W = 512;
+    private static final int DIAG_TEX_H = 640;
+    private final AtomicReference<ByteBuffer> pendingDiagPanel = new AtomicReference<>();
+    private final Object diagDrawLock = new Object();
+    private ByteBuffer[] diagBuffers;
+    private int diagBufferIndex;
+    private Bitmap diagBitmap;
+    private Canvas diagCanvas;
+    private volatile boolean diagVisible;
+    private boolean diagVisiblePrev;
+    private volatile StreamDiagnostics lastDiagStats;
     private String[] environmentFiles = new String[0];
     private volatile int environmentChoice = CELL_VOID;
     private volatile boolean passthroughOn;
@@ -202,9 +222,10 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     private native void nativeSetScreenPose(long ctx, float[] pose);
     private native void nativeUploadBackground(long ctx, ByteBuffer pixels, int width, int height);
     private native void nativeUploadPicker(long ctx, ByteBuffer grid, ByteBuffer button,
-                                           ByteBuffer exit);
+                                           ByteBuffer exit, ByteBuffer diag);
     private native void nativeSetEnvironment(long ctx, int choice, boolean backgroundOn);
     private native void nativeUploadOverlay(long ctx, ByteBuffer pixels, int width, int height);
+    private native void nativeUploadDiagnostics(long ctx, ByteBuffer pixels);
     private native float nativeGetWarpGpuMs(long ctx);
     private native void nativeDestroy(long ctx);
 
@@ -480,8 +501,14 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
             ByteBuffer grid = pendingPickerArt.getAndSet(null);
             ByteBuffer button = pendingEnvButton.getAndSet(null);
             ByteBuffer exitArt = pendingExitButton.getAndSet(null);
-            if (grid != null || button != null || exitArt != null) {
-                nativeUploadPicker(nativeCtx, grid, button, exitArt);
+            ByteBuffer diagArt = pendingDiagButton.getAndSet(null);
+            if (grid != null || button != null || exitArt != null || diagArt != null) {
+                nativeUploadPicker(nativeCtx, grid, button, exitArt, diagArt);
+            }
+
+            ByteBuffer diagPanel = pendingDiagPanel.getAndSet(null);
+            if (diagPanel != null) {
+                nativeUploadDiagnostics(nativeCtx, diagPanel);
             }
 
             ByteBuffer background = pendingBackground.getAndSet(null);
@@ -723,6 +750,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
 
         pendingEnvButton.set(toBuffer(buildEnvButton()));
         pendingExitButton.set(toBuffer(buildExitButton()));
+        pendingDiagButton.set(toBuffer(buildDiagButton()));
     }
 
     // A framed landscape, which is about as much as reads at this size
@@ -771,6 +799,30 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         paint.setStrokeCap(Paint.Cap.ROUND);
         canvas.drawLine(44.0f, 44.0f, 84.0f, 84.0f, paint);
         canvas.drawLine(84.0f, 44.0f, 44.0f, 84.0f, paint);
+
+        return button;
+    }
+
+    // A framed letter i, the usual mark for information. Toggles the
+    // stream diagnostics panel beside the screen.
+    private Bitmap buildDiagButton() {
+        Bitmap button = Bitmap.createBitmap(ENV_BUTTON_TEX, ENV_BUTTON_TEX,
+                                            Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(button);
+        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        canvas.drawColor(0, PorterDuff.Mode.CLEAR);
+
+        paint.setColor(0xEEFFFFFF);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(6.0f);
+        canvas.drawRoundRect(new RectF(14.0f, 14.0f, 114.0f, 114.0f), 22.0f, 22.0f, paint);
+
+        paint.setStyle(Paint.Style.FILL);
+        canvas.drawCircle(64.0f, 42.0f, 7.0f, paint);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(11.0f);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        canvas.drawLine(64.0f, 60.0f, 64.0f, 90.0f, paint);
 
         return button;
     }
@@ -878,6 +930,24 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
             LimeLog.info("XR exit button clicked, ending the stream");
             inputListener.onVrExit();
         }
+
+        // The diagnostics panel follows the native toggle. On opening, a
+        // panel is drawn right away (placeholders until the first stats
+        // land), off this thread so the frame loop never blocks on text
+        // layout. While hidden, nothing is drawn and nothing is uploaded.
+        boolean diagNow = inputState[IN_DIAG] != 0.0f;
+        diagVisible = diagNow;
+        if (diagNow && !diagVisiblePrev) {
+            Thread first = new Thread() {
+                @Override
+                public void run() {
+                    drawDiagnostics(lastDiagStats);
+                }
+            };
+            first.setName("Video - XR Diagnostics");
+            first.start();
+        }
+        diagVisiblePrev = diagNow;
     }
 
     // Written once when a grab ends, so the screen is where it was left next
@@ -1014,6 +1084,138 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
             sb.append('\n').append("Depth frames skipped: ").append(lastDepthSkips);
         }
         return sb.toString();
+    }
+
+    /**
+     * True while the in-session diagnostics panel is open. The decoder
+     * checks this before building a snapshot, so a hidden panel costs one
+     * volatile read per stats window and nothing more.
+     */
+    public boolean isDiagnosticsVisible() {
+        return diagVisible;
+    }
+
+    /**
+     * A fresh stats snapshot from the decoder, about once a second while
+     * the panel is open. Runs on the decoder's submission thread; the
+     * bitmap work stays off the frame loop, same rule as the stats
+     * overlay.
+     */
+    public void updateDiagnostics(StreamDiagnostics stats) {
+        lastDiagStats = stats;
+        if (!diagVisible || nativeCtx == 0) {
+            return;
+        }
+        drawDiagnostics(stats);
+    }
+
+    /**
+     * Draws the panel: a dark rounded card, two columns, labels left and
+     * monospace values right, HydraUi palette. Serialized by a lock since
+     * both the decoder thread and the open-toggle thread land here.
+     */
+    private void drawDiagnostics(StreamDiagnostics d) {
+        if (nativeCtx == 0) {
+            return;
+        }
+        synchronized (diagDrawLock) {
+            // The previous panel has not been picked up yet, so skip this
+            // one rather than write a buffer the frame loop may be reading
+            if (pendingDiagPanel.get() != null) {
+                return;
+            }
+            if (diagBitmap == null) {
+                diagBitmap = Bitmap.createBitmap(DIAG_TEX_W, DIAG_TEX_H,
+                        Bitmap.Config.ARGB_8888);
+                diagCanvas = new Canvas(diagBitmap);
+                diagBuffers = new ByteBuffer[2];
+                for (int i = 0; i < diagBuffers.length; i++) {
+                    diagBuffers[i] = ByteBuffer.allocateDirect(DIAG_TEX_W * DIAG_TEX_H * 4);
+                    diagBuffers[i].order(ByteOrder.nativeOrder());
+                }
+            }
+
+            Canvas canvas = diagCanvas;
+            canvas.drawColor(0, PorterDuff.Mode.CLEAR);
+
+            Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+            fill.setColor(HydraUi.COLOR_OVERLAY_SCRIM);
+            RectF card = new RectF(2.0f, 2.0f, DIAG_TEX_W - 2.0f, DIAG_TEX_H - 2.0f);
+            canvas.drawRoundRect(card, 24.0f, 24.0f, fill);
+
+            Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+            stroke.setStyle(Paint.Style.STROKE);
+            stroke.setStrokeWidth(2.0f);
+            stroke.setColor(HydraUi.COLOR_STROKE);
+            canvas.drawRoundRect(card, 24.0f, 24.0f, stroke);
+
+            Paint title = new Paint(Paint.ANTI_ALIAS_FLAG);
+            title.setColor(HydraUi.COLOR_TEXT);
+            title.setTextSize(30.0f);
+            title.setTypeface(Typeface.DEFAULT_BOLD);
+            canvas.drawText("Stream diagnostics", 24.0f, 58.0f, title);
+
+            Paint label = new Paint(Paint.ANTI_ALIAS_FLAG);
+            label.setColor(HydraUi.COLOR_TEXT_DIM);
+            label.setTextSize(22.0f);
+
+            Paint value = new Paint(Paint.ANTI_ALIAS_FLAG);
+            value.setColor(HydraUi.COLOR_TEXT);
+            value.setTextSize(22.0f);
+            value.setTypeface(Typeface.MONOSPACE);
+            value.setTextAlign(Paint.Align.RIGHT);
+
+            float y = 106.0f;
+            for (String[] row : diagnosticsRows(d)) {
+                canvas.drawText(row[0], 24.0f, y, label);
+                canvas.drawText(row[1], DIAG_TEX_W - 24.0f, y, value);
+                y += 38.0f;
+            }
+
+            ByteBuffer buf = diagBuffers[diagBufferIndex];
+            diagBufferIndex = (diagBufferIndex + 1) % diagBuffers.length;
+            buf.rewind();
+            diagBitmap.copyPixelsToBuffer(buf);
+            buf.rewind();
+            pendingDiagPanel.set(buf);
+        }
+    }
+
+    // Two columns, iPad panel parity. Placeholders until the numbers exist.
+    private static String[][] diagnosticsRows(StreamDiagnostics d) {
+        final String na = "--";
+        if (d == null) {
+            return new String[][] {
+                    { "Route", na }, { "Body", na }, { "Codec", na },
+                    { "Stream", na }, { "Bitrate", na }, { "RTT", na },
+                    { "RTT variance", na }, { "FPS incoming", na },
+                    { "FPS rendered", na }, { "Net drops", na },
+                    { "Host latency", na }, { "Host min / max", na },
+                    { "Decode time", na },
+            };
+        }
+        boolean hasRtt = d.rttMs > 0 || d.rttVarianceMs > 0;
+        return new String[][] {
+                { "Route", d.route != null ? d.route : na },
+                { "Body", d.bodyHost != null ? d.bodyHost : na },
+                { "Codec", d.codec != null ? d.codec : na },
+                { "Stream", d.width > 0
+                        ? d.width + "x" + d.height + " @ " + d.targetFps : na },
+                { "Bitrate", d.bitrateKbps > 0
+                        ? String.format("%.1f Mbps", d.bitrateKbps / 1000.0f) : na },
+                { "RTT", hasRtt ? d.rttMs + " ms" : na },
+                { "RTT variance", hasRtt ? d.rttVarianceMs + " ms" : na },
+                { "FPS incoming", String.format("%.1f", d.incomingFps) },
+                { "FPS rendered", String.format("%.1f", d.renderedFps) },
+                { "Net drops", String.format("%.1f %%", d.netDropPercent) },
+                { "Host latency", d.hasHostLatency
+                        ? String.format("%.1f ms", d.hostLatencyAvgMs) : na },
+                { "Host min / max", d.hasHostLatency
+                        ? String.format("%.1f / %.1f ms", d.hostLatencyMinMs, d.hostLatencyMaxMs)
+                        : na },
+                { "Decode time", d.decodeTimeMs >= 0.0f
+                        ? String.format("%.1f ms", d.decodeTimeMs) : na },
+        };
     }
 
     private static String msPer(long totalNs, long count) {
