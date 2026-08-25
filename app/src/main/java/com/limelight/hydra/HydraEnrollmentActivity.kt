@@ -91,7 +91,7 @@ class HydraEnrollmentActivity : Activity(), HydraQrScanner.Listener {
 
         statusView = TextView(this).apply {
             setTextColor(HydraUi.COLOR_TEXT_DIM)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.TEXT_BUTTON)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_BUTTON))
             gravity = Gravity.CENTER
             setPadding(0, dp(HydraUi.SPACE_M), 0, dp(HydraUi.SPACE_M))
         }

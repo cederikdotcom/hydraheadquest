@@ -4,9 +4,11 @@ import android.app.Activity
 import android.app.Application
 import android.content.Context
 import android.os.Bundle
+import android.preference.PreferenceManager
 import android.util.Log
 import com.limelight.Game
 import com.limelight.computers.IdentityManager
+import com.limelight.preferences.PreferenceConfiguration
 
 /**
  * Application subclass owning the Hydra head state machine.
@@ -68,6 +70,8 @@ class HydraApp : Application() {
     override fun onCreate() {
         super.onCreate()
 
+        seedVrEnvironmentDefault()
+
         hydraWireGuard = HydraWireGuard(this)
         hydraState = HydraState(this, HydraConfigStore(this))
         streamHooks = HydraStreamHooks(this, hydraState)
@@ -125,5 +129,29 @@ class HydraApp : Application() {
                 Log.w(TAG, "wireguard auto bring-up failed: ${t.message}")
             }
         }, "HydraWgStart").start()
+    }
+
+    /**
+     * Seed the XR streaming environment to the black void on first run.
+     *
+     * Upstream XrRenderer defaults an unset "vr_environment" preference
+     * to the first 4096x2048 equirect photo. That extra composited
+     * background layer is too heavy for the Quest 2 GPU while it also
+     * decodes a 1080p60 stream: the stream visibly chops. The void
+     * (picker cell 1) submits no background layer at all, so it is the
+     * lightest option, cheaper than passthrough too.
+     *
+     * Seeding the preference here keeps upstream code untouched. The
+     * in-stream environment picker still works: a user pick overwrites
+     * this value, and we never seed again once the key exists.
+     */
+    private fun seedVrEnvironmentDefault() {
+        val prefs = PreferenceManager.getDefaultSharedPreferences(this)
+        if (!prefs.contains(PreferenceConfiguration.VR_ENVIRONMENT_PREF_STRING)) {
+            // 1 = XrRenderer CELL_VOID (0 is passthrough, 2 and up are photos).
+            prefs.edit()
+                .putInt(PreferenceConfiguration.VR_ENVIRONMENT_PREF_STRING, 1)
+                .apply()
+        }
     }
 }

@@ -235,7 +235,7 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
         val label = TextView(this).apply {
             text = experience.label
             setTextColor(HydraUi.COLOR_TEXT)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.TEXT_TILE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_TILE))
             typeface = Typeface.DEFAULT_BOLD
         }
         val details = mutableListOf<String>()
@@ -246,7 +246,7 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
         val caption = TextView(this).apply {
             text = details.joinToString("  ·  ")
             setTextColor(HydraUi.COLOR_TEXT_FAINT)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.TEXT_CAPTION)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_CAPTION))
             setPadding(0, dp(8), 0, 0)
         }
         val tile = LinearLayout(this).apply {
@@ -427,7 +427,7 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
         val wrongLabel = TextView(this).apply {
             text = "Wrong PIN"
             setTextColor(HydraUi.COLOR_RED)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.TEXT_BODY)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_BODY))
             visibility = View.INVISIBLE
         }
         column.addView(wrongLabel)
@@ -484,7 +484,7 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
                         text = key
                         gravity = Gravity.CENTER
                         setTextColor(HydraUi.COLOR_TEXT)
-                        setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.TEXT_TILE)
+                        setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_TILE))
                         background = HydraUi.pressableCard(
                             this@HydraCatalogActivity,
                             radiusDp = HydraUi.RADIUS_BUTTON
@@ -586,13 +586,13 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
         val keyView = TextView(this).apply {
             text = key
             setTextColor(HydraUi.COLOR_TEXT_DIM)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.TEXT_BODY)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_BODY))
         }
         val valueView = TextView(this).apply {
             text = value
             typeface = Typeface.MONOSPACE
             setTextColor(HydraUi.COLOR_TEXT)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.TEXT_BODY)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_BODY))
         }
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -685,7 +685,7 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
         val statusText = TextView(this).apply {
             text = "Checking status..."
             setTextColor(HydraUi.COLOR_TEXT_DIM)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.TEXT_TILE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_TILE))
             typeface = Typeface.DEFAULT_BOLD
         }
         statusRow.addView(statusText)
@@ -701,7 +701,7 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
             text = ""
             typeface = Typeface.MONOSPACE
             setTextColor(HydraUi.COLOR_TEXT_DIM)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.TEXT_BODY)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_BODY))
             setPadding(0, dp(8), 0, 0)
         }
         column.addView(handshakeText)
@@ -709,7 +709,7 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
         val messageText = TextView(this).apply {
             text = ""
             setTextColor(HydraUi.COLOR_TEXT_DIM)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.TEXT_BODY)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_BODY))
             background = HydraUi.card(
                 this@HydraCatalogActivity, HydraUi.COLOR_SURFACE
             )
@@ -940,7 +940,7 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
         }
         emptyView = TextView(this).apply {
             setTextColor(HydraUi.COLOR_TEXT_DIM)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.TEXT_BUTTON)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_BUTTON))
             gravity = Gravity.CENTER
             setPadding(dp(HydraUi.SPACE_M), dp(120), dp(HydraUi.SPACE_M), dp(HydraUi.SPACE_M))
         }
@@ -983,13 +983,13 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
         // Status panel for discovering / pairing / streaming / error.
         statusTitle = TextView(this).apply {
             setTextColor(HydraUi.COLOR_TEXT)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.TEXT_STATUS)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_STATUS))
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
         }
         statusMessage = TextView(this).apply {
             setTextColor(HydraUi.COLOR_TEXT_DIM)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.TEXT_BUTTON)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_BUTTON))
             gravity = Gravity.CENTER
             setPadding(dp(HydraUi.SPACE_M), dp(HydraUi.SPACE_S), dp(HydraUi.SPACE_M), dp(HydraUi.SPACE_M))
         }
@@ -1034,7 +1034,7 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
         identityView = TextView(this).apply {
             typeface = Typeface.MONOSPACE
             setTextColor(HydraUi.COLOR_TEXT_FAINT)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.TEXT_BODY)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_BODY))
         }
         root.addView(
             identityView,
@@ -1049,7 +1049,7 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
         val operatorButton = TextView(this).apply {
             text = "Operator"
             setTextColor(HydraUi.COLOR_TEXT_FAINT)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.TEXT_BODY)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.sp(context, HydraUi.TEXT_BODY))
             setPadding(dp(HydraUi.SPACE_M), dp(HydraUi.SPACE_S), dp(HydraUi.SPACE_M), dp(HydraUi.SPACE_S))
             isClickable = true
             isFocusable = true

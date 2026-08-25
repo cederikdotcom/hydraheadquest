@@ -2,6 +2,7 @@ package com.limelight.hydra
 
 import android.content.Context
 import android.graphics.Typeface
+import android.os.Build
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
 import android.util.TypedValue
@@ -65,8 +66,51 @@ object HydraUi {
     const val BUTTON_MIN_HEIGHT = 64
     const val BUTTON_MIN_WIDTH = 220
 
+    // ------------------------------------------------------------------
+    // Panel scale
+    // ------------------------------------------------------------------
+
+    /**
+     * Horizon OS presents the app as a flat 2D panel and reports it with
+     * densityDpi=0, so dp and sp map near 1:1 to pixels on a surface that
+     * is 3664 px wide on Quest 2. A phone-tuned type scale renders tiny
+     * there. Scale every dp and sp value by the real panel width: 1x up
+     * to 1600 px wide, proportional above that, capped at 3x. On the
+     * Quest panel this gives about 2.3x. On a phone it stays 1x.
+     */
+    @Volatile
+    private var cachedScale = 0f
+
+    fun scale(context: Context): Float {
+        val cached = cachedScale
+        if (cached > 0f) return cached
+        val width = context.resources.displayMetrics.widthPixels
+        if (width > 0) {
+            val computed = (width / 1600f).coerceIn(1f, 3f)
+            cachedScale = computed
+            return computed
+        }
+        // displayMetrics can lie (0 width) early on Horizon OS. Assume the
+        // Quest panel on Meta hardware; do not cache, so a later call with
+        // valid metrics recomputes.
+        return if (isQuestDevice()) 2f else 1f
+    }
+
+    private fun isQuestDevice(): Boolean {
+        val manufacturer = Build.MANUFACTURER?.lowercase() ?: ""
+        val model = Build.MODEL?.lowercase() ?: ""
+        return manufacturer.contains("oculus") ||
+            manufacturer.contains("meta") ||
+            model.contains("quest")
+    }
+
     fun dp(context: Context, value: Int): Int {
-        return (value * context.resources.displayMetrics.density).toInt()
+        return (value * context.resources.displayMetrics.density * scale(context)).toInt()
+    }
+
+    /** Panel-scaled sp value. Use for every setTextSize(COMPLEX_UNIT_SP, ...). */
+    fun sp(context: Context, value: Float): Float {
+        return value * scale(context)
     }
 
     // ------------------------------------------------------------------
@@ -115,7 +159,7 @@ object HydraUi {
         return TextView(context).apply {
             text = label
             setTextColor(COLOR_TEXT)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, TEXT_TITLE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, sp(context, TEXT_TITLE))
             typeface = Typeface.DEFAULT_BOLD
         }
     }
@@ -124,7 +168,7 @@ object HydraUi {
         return TextView(context).apply {
             text = label
             setTextColor(color)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, TEXT_BODY)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, sp(context, TEXT_BODY))
         }
     }
 
@@ -143,7 +187,7 @@ object HydraUi {
             text = label
             isAllCaps = false
             setTextColor(COLOR_TEXT)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, TEXT_BUTTON)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, sp(context, TEXT_BUTTON))
             background = if (primary) {
                 pressableCard(
                     context, COLOR_ACCENT, COLOR_ACCENT_PRESSED,
@@ -173,7 +217,7 @@ object HydraUi {
     fun styleField(context: Context, field: EditText) {
         field.setTextColor(COLOR_TEXT)
         field.setHintTextColor(COLOR_TEXT_FAINT)
-        field.setTextSize(TypedValue.COMPLEX_UNIT_SP, TEXT_BODY)
+        field.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp(context, TEXT_BODY))
         field.background = card(context, COLOR_SURFACE, RADIUS_BUTTON, COLOR_STROKE)
         field.setPadding(
             dp(context, SPACE_S), dp(context, SPACE_S),
