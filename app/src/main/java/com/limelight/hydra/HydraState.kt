@@ -194,6 +194,37 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
     private var tickFuture: ScheduledFuture<*>? = null
     private var commandFuture: ScheduledFuture<*>? = null
 
+    /**
+     * All candidate hosts of the body behind the current (or last
+     * launched) stream, captured at discovery time. The tick compares the
+     * server's stream block against this set, not against the single
+     * resolved streamHost: a mesh stream runs on the body's 10.10.x
+     * wireguard address while the stream block's stream_url_lan names the
+     * body's venue-LAN address, so a single-host compare misreads the
+     * head's own session as a changed assignment. Executor-confined.
+     */
+    private var currentBodyHosts: List<String> = emptyList()
+
+    /** A stream session that ended and must not be relaunched by the tick. */
+    private data class EndedSession(
+        val bodyId: String,
+        val app: String,
+        val hosts: List<String>
+    )
+
+    /**
+     * Set when a self-service stream ends (user stop, disconnect, or
+     * failure). hydracluster keeps a stream block for the head's own
+     * session (#137) and can still serve it after the DELETE, or forever
+     * when the DELETE failed. Without this guard the tick reads that
+     * stale block as an operator assignment and relaunches the stream
+     * seconds after it ended. While set, a matching assignment is ignored
+     * and the DELETE is retried; the marker clears when the block is gone
+     * server-side, when the user taps, or when a non-matching (genuinely
+     * new) assignment arrives. Executor-confined.
+     */
+    private var endedSession: EndedSession? = null
+
     // ------------------------------------------------------------------
     // Lifecycle
     // ------------------------------------------------------------------
@@ -296,6 +327,8 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
         executor.execute {
             val current = state
             if (current is State.SelfService || current is State.Idle) {
+                // A fresh tap always overrides the ended-session guard.
+                endedSession = null
                 startExperience(experience, selfService = true)
             }
         }
@@ -309,6 +342,7 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
         executor.execute {
             val current = state
             if (current !is State.Streaming) return@execute
+            markEnded(current)
             streamHooks?.stopStream()
             try {
                 client?.deleteStream(current.bodyId)
@@ -328,6 +362,7 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
         executor.execute {
             val current = state
             if (current is State.Streaming) {
+                markEnded(current)
                 try {
                     client?.deleteStream(current.bodyId)
                 } catch (e: IOException) {
@@ -349,6 +384,7 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
         executor.execute {
             val current = state
             if (current !is State.Streaming) return@execute
+            markEnded(current)
             try {
                 client?.deleteStream(current.bodyId)
             } catch (e: IOException) {
@@ -360,6 +396,43 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
     }
 
     /**
+     * Remember a self-service session on its way out, so the tick does
+     * not relaunch it from the head's own stale server-side stream block.
+     * Operator-assigned sessions are NOT marked: an assignment that
+     * persists server-side is meant to restart (that is the assignment
+     * contract), and only the head's own self-service record must never
+     * act as one.
+     */
+    private fun markEnded(current: State.Streaming) {
+        if (!current.selfService) return
+        endedSession = EndedSession(
+            bodyId = current.bodyId,
+            app = current.experience.name,
+            hosts = (currentBodyHosts + current.host).distinct()
+        )
+    }
+
+    /** Hosts named by the config's stream block: stream_url_lan and stream_url. */
+    private fun assignmentHosts(config: HeadConfig): List<String> {
+        val s = config.stream ?: return emptyList()
+        return listOfNotNull(
+            s.streamUrlLan?.takeIf { it.isNotEmpty() }?.let { HeadConfig.stripScheme(it) },
+            s.streamUrl?.takeIf { it.isNotEmpty() }?.let { HeadConfig.stripScheme(it) }
+        ).distinct()
+    }
+
+    /**
+     * True when the two host sets can refer to the same body. An empty
+     * set cannot disprove anything, so it counts as a match: when in
+     * doubt, treat the assignment as unchanged rather than kill and
+     * relaunch a running stream.
+     */
+    private fun hostsOverlap(a: List<String>, b: List<String>): Boolean {
+        if (a.isEmpty() || b.isEmpty()) return true
+        return a.any { it in b }
+    }
+
+    /**
      * Pairing, app lookup, or the activity launch failed before the stream
      * was established. Called by StreamHooks with a user-readable message.
      */
@@ -367,6 +440,7 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
         executor.execute {
             val current = state
             if (current is State.Streaming) {
+                markEnded(current)
                 try {
                     client?.deleteStream(current.bodyId)
                 } catch (e: IOException) {
@@ -456,21 +530,63 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
             is State.Idle, is State.SelfService -> {
                 val appId = config.stream?.streamAppId
                 if (config.hasActiveAssignment && appId != null) {
-                    val experience = cachedCatalog.firstOrNull { it.name == appId }
-                        ?: Experience(appId, appId, null, false)
-                    startExperience(experience, selfService = false)
+                    val ended = endedSession
+                    if (ended != null && appId == ended.app &&
+                        hostsOverlap(assignmentHosts(config), ended.hosts)
+                    ) {
+                        // The head's own just-ended session, still stored
+                        // server-side as a stream block (#137). Never
+                        // relaunch from it; retry the DELETE until the
+                        // block clears, then the marker resets below.
+                        Log.i(
+                            "HydraStream",
+                            "ignoring stale stream block for ended session " +
+                                "(app=$appId body=${ended.bodyId}); retrying delete"
+                        )
+                        try {
+                            client?.deleteStream(ended.bodyId)
+                        } catch (e: IOException) {
+                            Log.w(TAG, "stale stream block delete failed: ${e.message}")
+                        }
+                    } else {
+                        endedSession = null
+                        val experience = cachedCatalog.firstOrNull { it.name == appId }
+                            ?: Experience(appId, appId, null, false)
+                        startExperience(experience, selfService = false)
+                    }
                 } else {
+                    // No stream block server-side: any earlier session is
+                    // fully cleaned up; a future assignment is genuinely new.
+                    endedSession = null
                     // Stay in selfService with the latest catalog.
                     setState(State.SelfService(cachedCatalog))
                 }
             }
             is State.Streaming -> {
                 if (config.hasActiveAssignment) {
-                    // Restart only on a real host or app change.
-                    // Never re-pair a stable stream.
-                    val newHost = config.streamHost
+                    // Restart only on a real app or body change. Never
+                    // re-pair a stable stream. The body is matched on ALL
+                    // of its known hosts, not on the single resolved
+                    // streamHost: a mesh stream runs on the body's
+                    // 10.10.x address while the stream block's
+                    // stream_url_lan names its venue-LAN address, and the
+                    // old single-host compare read the head's own session
+                    // as a changed assignment, killing and relaunching a
+                    // healthy stream on the first 5 s tick that saw the
+                    // block (the ~23 s stream deaths with a GameXR
+                    // relaunch 4 s later, seen 2026-08-25).
                     val newApp = config.stream?.streamAppId
-                    if (newHost != current.host || newApp != current.experience.name) {
+                    val newHosts = assignmentHosts(config)
+                    val knownHosts = (currentBodyHosts + current.host).distinct()
+                    val sameApp = newApp == current.experience.name
+                    val sameBody = hostsOverlap(newHosts, knownHosts)
+                    if (!sameApp || !sameBody) {
+                        Log.i(
+                            "HydraStream",
+                            "assignment changed (app $newApp vs " +
+                                "${current.experience.name}, hosts $newHosts " +
+                                "vs $knownHosts); restarting stream"
+                        )
                         restartForAssignment(current, newApp)
                     }
                 }
@@ -527,6 +643,11 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
                 setState(State.Error("Body has no reachable IP"))
                 return
             }
+            // Remember every address of this body: the tick matches the
+            // server's stream block against the full set, since the block
+            // may name a different address of the same body than the one
+            // the head streams from.
+            currentBodyHosts = body.candidateHosts()
             setState(State.Pairing(body.name ?: bodyId, host, experience))
             val hooks = streamHooks
             if (hooks != null) {

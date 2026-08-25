@@ -193,6 +193,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     public static final String EXTRA_APP_HDR = "HDR";
     public static final String EXTRA_SERVER_CERT = "ServerCert";
     public static final String EXTRA_RETURN_TO_PC_VIEW = "ReturnToPcView";
+    // Hydra: set by HydraStreamHooks for WireGuard mesh hosts (10.10.0.0/16).
+    // Forces remote streaming tuning (1024-byte video packets, no LAN
+    // detection); the measured mesh path is 42-146 ms RTT with heavy jitter.
+    public static final String EXTRA_HYDRA_REMOTE_TUNED = "HydraRemoteTuned";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -331,6 +335,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         String uniqueId = Game.this.getIntent().getStringExtra(EXTRA_UNIQUEID);
         boolean appSupportsHdr = Game.this.getIntent().getBooleanExtra(EXTRA_APP_HDR, false);
         byte[] derCertData = Game.this.getIntent().getByteArrayExtra(EXTRA_SERVER_CERT);
+        boolean hydraRemoteTuned = Game.this.getIntent().getBooleanExtra(EXTRA_HYDRA_REMOTE_TUNED, false);
 
         app = new NvApp(appName != null ? appName : "app", appId, appSupportsHdr);
 
@@ -484,8 +489,16 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 .setBitrate(prefConfig.bitrate)
                 .setEnableSops(prefConfig.enableSops)
                 .enableLocalAudioPlayback(prefConfig.playHostAudio)
-                .setMaxPacketSize(1392)
-                .setRemoteConfiguration(StreamConfiguration.STREAM_CFG_AUTO) // NvConnection will perform LAN and VPN detection
+                // Hydra: mesh-routed hosts stream with the remote profile.
+                // The WireGuard tunnel MTU is 1420 and the hub path shows
+                // 42-146 ms RTT with heavy jitter, so use the 1024-byte
+                // remote packet size (well under the tunnel MTU, with
+                // margin) instead of the 1392-byte LAN size, and skip the
+                // LAN/VPN auto detection that misreads 10.10.x as LAN.
+                .setMaxPacketSize(hydraRemoteTuned ? 1024 : 1392)
+                .setRemoteConfiguration(hydraRemoteTuned ?
+                        StreamConfiguration.STREAM_CFG_REMOTE :
+                        StreamConfiguration.STREAM_CFG_AUTO) // NvConnection will perform LAN and VPN detection
                 .setSupportedVideoFormats(supportedVideoFormats)
                 .setAttachedGamepadMask(gamepadMask)
                 .setClientRefreshRateX100((int)(displayRefreshRate * 100))
@@ -2271,6 +2284,13 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
     @Override
     public void stageFailed(final String stage, final int portFlags, final int errorCode) {
+        // Hydra: LimeLog goes to java.util.logging, which never reaches
+        // logcat on Quest. Mirror connection failures to logcat so a dead
+        // session is diagnosable from adb alone.
+        android.util.Log.e("HydraStream", "stageFailed: stage=" + stage
+                + " errorCode=" + errorCode
+                + " portFlags=0x" + Integer.toHexString(portFlags));
+
         // Perform a connection test if the failure could be due to a blocked port
         // This does network I/O, so don't do it on the main thread.
         final int portTestResult = MoonBridge.testClientConnectivity(ServerHelper.CONNECTION_TEST_SERVER, 443, portFlags);
@@ -2311,6 +2331,11 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
     @Override
     public void connectionTerminated(final int errorCode) {
+        // Hydra: mirror the termination code to logcat (LimeLog is
+        // invisible on Quest). 0 is ML_ERROR_GRACEFUL_TERMINATION.
+        android.util.Log.e("HydraStream", "connectionTerminated: errorCode=" + errorCode
+                + " (0x" + Integer.toHexString(errorCode) + ")");
+
         // Perform a connection test if the failure could be due to a blocked port
         // This does network I/O, so don't do it on the main thread.
         final int portFlags = MoonBridge.getPortFlagsFromTerminationErrorCode(errorCode);
@@ -2424,6 +2449,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
     @Override
     public void connectionStarted() {
+        // Hydra: marks stream-up in logcat, the reference point for
+        // session lifetime when reading a termination log line later.
+        android.util.Log.i("HydraStream", "connectionStarted");
+
         runOnUiThread(new Runnable() {
             @Override
             public void run() {

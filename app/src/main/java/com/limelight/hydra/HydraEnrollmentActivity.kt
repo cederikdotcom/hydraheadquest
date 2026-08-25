@@ -10,12 +10,14 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.text.InputType
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -43,7 +45,9 @@ import kotlin.concurrent.thread
  *     --es server_url https://hydracluster.example.com \
  *     --es enrollment_token TOKEN
  *
- * The UI is built in code so the scaffold adds no layout resources.
+ * The UI is built in code so the scaffold adds no layout resources. Styling
+ * comes from [HydraUi]: the panel renders at a distance in VR, so text and
+ * touch targets are sized up and the QR preview is 320 dp tall.
  */
 class HydraEnrollmentActivity : Activity(), HydraQrScanner.Listener {
 
@@ -74,77 +78,84 @@ class HydraEnrollmentActivity : Activity(), HydraQrScanner.Listener {
         super.onCreate(savedInstanceState)
         store = HydraConfigStore(this)
 
-        val root = LinearLayout(this).apply {
+        val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            val pad = (24 * resources.displayMetrics.density).toInt()
-            setPadding(pad, pad, pad, pad)
+            setPadding(
+                dp(HydraUi.SPACE_L), dp(HydraUi.SPACE_L),
+                dp(HydraUi.SPACE_L), dp(HydraUi.SPACE_L)
+            )
         }
 
-        val title = TextView(this).apply {
-            text = "Hydra Head Enrollment"
-            textSize = 24f
-        }
-        root.addView(title)
+        column.addView(HydraUi.title(this, "Hydra Head Enrollment"))
 
         statusView = TextView(this).apply {
-            textSize = 16f
-            setPadding(0, 24, 0, 24)
+            setTextColor(HydraUi.COLOR_TEXT_DIM)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, HydraUi.TEXT_BUTTON)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(HydraUi.SPACE_M), 0, dp(HydraUi.SPACE_M))
         }
-        root.addView(statusView)
+        column.addView(statusView)
 
-        // Small live preview for the QR scan. Hidden until a scan starts.
+        // Live preview for the QR scan. Hidden until a scan starts.
         previewView = TextureView(this).apply {
             visibility = View.GONE
             surfaceTextureListener = previewListener
         }
-        val previewHeight = (220 * resources.displayMetrics.density).toInt()
-        root.addView(
+        column.addView(
             previewView,
             LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                previewHeight
-            ).apply { topMargin = 16 }
+                dp(320)
+            ).apply { topMargin = dp(HydraUi.SPACE_S) }
         )
 
-        scanButton = Button(this).apply {
-            text = "Scan fleet QR"
-            setOnClickListener { requestScan() }
-        }
-        root.addView(scanButton, matchWidth())
+        scanButton = HydraUi.bigButton(this, "Scan fleet QR") { requestScan() }
+        column.addView(scanButton, matchWidth())
 
         serverUrlField = EditText(this).apply {
             hint = "Server URL (https://...)"
             inputType = InputType.TYPE_TEXT_VARIATION_URI
             maxLines = 1
         }
-        root.addView(serverUrlField, matchWidth())
+        HydraUi.styleField(this, serverUrlField)
+        column.addView(serverUrlField, matchWidth())
 
         tokenField = EditText(this).apply {
             hint = "Enrollment token"
             inputType = InputType.TYPE_CLASS_TEXT
             maxLines = 1
         }
-        root.addView(tokenField, matchWidth())
+        HydraUi.styleField(this, tokenField)
+        column.addView(tokenField, matchWidth())
 
-        enrollButton = Button(this).apply {
-            text = "Enroll"
-            setOnClickListener { startManualEnrollment() }
+        enrollButton = HydraUi.bigButton(this, "Enroll", primary = true) {
+            startManualEnrollment()
         }
-        root.addView(enrollButton, matchWidth())
+        column.addView(enrollButton, matchWidth())
 
-        val resetButton = Button(this).apply {
-            text = "Reset enrollment"
-            setOnClickListener {
-                store.clear()
-                refreshStatus()
-            }
+        val resetButton = HydraUi.bigButton(this, "Reset enrollment") {
+            store.clear()
+            refreshStatus()
         }
-        root.addView(resetButton, matchWidth())
+        column.addView(resetButton, matchWidth())
 
-        val scroll = ScrollView(this)
+        // Cap the column width and center it on the panel.
+        val frame = FrameLayout(this)
+        frame.addView(
+            column,
+            FrameLayout.LayoutParams(
+                dp(640),
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            )
+        )
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(HydraUi.COLOR_BACKGROUND)
+            isFillViewport = true
+        }
         scroll.addView(
-            root,
+            frame,
             ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -174,20 +185,28 @@ class HydraEnrollmentActivity : Activity(), HydraQrScanner.Listener {
         return LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = 16 }
+        ).apply { topMargin = dp(HydraUi.SPACE_S) }
+    }
+
+    private fun dp(value: Int): Int = HydraUi.dp(this, value)
+
+    /** Enabled state plus a visible cue; custom backgrounds have none. */
+    private fun Button.setEnabledVisual(enabled: Boolean) {
+        isEnabled = enabled
+        alpha = if (enabled) 1f else 0.45f
     }
 
     private fun refreshStatus() {
         val config = store.load()
         if (config != null) {
             statusView.text = "Enrolled as head ${config.headId}\nServer: ${config.serverUrl}"
-            enrollButton.isEnabled = false
-            scanButton.isEnabled = false
+            enrollButton.setEnabledVisual(false)
+            scanButton.setEnabledVisual(false)
         } else {
             statusView.text = "Not enrolled. Scan the fleet QR code " +
                     "or enter the server URL and token."
-            enrollButton.isEnabled = true
-            scanButton.isEnabled = true
+            enrollButton.setEnabledVisual(true)
+            scanButton.setEnabledVisual(true)
         }
     }
 
@@ -361,8 +380,8 @@ class HydraEnrollmentActivity : Activity(), HydraQrScanner.Listener {
      * config, and show the enrolled state. Identical for QR and manual.
      */
     private fun enroll(serverUrl: String, token: String) {
-        enrollButton.isEnabled = false
-        scanButton.isEnabled = false
+        enrollButton.setEnabledVisual(false)
+        scanButton.setEnabledVisual(false)
         statusView.text = "Enrolling..."
         val name = defaultHeadName()
         thread(name = "HydraEnroll") {
@@ -381,8 +400,8 @@ class HydraEnrollmentActivity : Activity(), HydraQrScanner.Listener {
             } catch (e: IOException) {
                 runOnUiThread {
                     statusView.text = "Enrollment failed: ${e.message}"
-                    enrollButton.isEnabled = true
-                    scanButton.isEnabled = true
+                    enrollButton.setEnabledVisual(true)
+                    scanButton.setEnabledVisual(true)
                 }
             }
         }

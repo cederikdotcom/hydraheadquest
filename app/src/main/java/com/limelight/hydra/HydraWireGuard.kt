@@ -44,6 +44,20 @@ class HydraWireGuard(context: Context) {
         /** App-private config file in Context.filesDir. */
         const val CONFIG_FILE_NAME = "wg-hydra.conf"
 
+        /**
+         * Interface MTU applied at parse time. The hydraguard config has
+         * no MTU line (the contract says not to add one to the stored
+         * text), and GoBackend then brings the tun up with its 1280
+         * default. 1420 is the WireGuard-over-IPv4 convention (1500 minus
+         * 80 bytes of overhead) that the Windows bodies on this mesh use.
+         * Setting it aligns the head with the rest of the fleet and
+         * removes one variable from stream debugging. Verified on
+         * hardware 2026-08-25: 1420-byte inner packets traverse the
+         * tunnel with 0% loss, so this is convention alignment, not a
+         * packet-drop fix.
+         */
+        const val TUNNEL_MTU = 1420
+
         /** Cap for error text in the heartbeat diagnostics value. */
         private const val ERROR_TRUNCATE = 60
     }
@@ -157,6 +171,32 @@ class HydraWireGuard(context: Context) {
         return connect(text)
     }
 
+    /**
+     * The config text with an explicit MTU line in its [Interface]
+     * section. Idempotent: a config that already carries an MTU line is
+     * returned unchanged. The stored file keeps the exact text the
+     * cluster served (contract section 12); the MTU is a client-side,
+     * parse-time addition only. Text injection is preferred over
+     * rebuilding via Config.Builder/Interface.Builder because it does
+     * not depend on the builder API surface of the wireguard-android
+     * version in use.
+     */
+    private fun withInterfaceMtu(configText: String): String {
+        if (Regex("(?im)^\\s*MTU\\s*=").containsMatchIn(configText)) {
+            return configText
+        }
+        val lines = configText.lines().toMutableList()
+        val idx = lines.indexOfFirst {
+            it.trim().equals("[Interface]", ignoreCase = true)
+        }
+        if (idx < 0) {
+            // Malformed config; let Config.parse report the real problem.
+            return configText
+        }
+        lines.add(idx + 1, "MTU = $TUNNEL_MTU")
+        return lines.joinToString("\n")
+    }
+
     private fun connect(configText: String): Boolean {
         val b = backendOrNull()
         if (b == null) {
@@ -164,7 +204,7 @@ class HydraWireGuard(context: Context) {
             return false
         }
         return try {
-            val config = BufferedReader(StringReader(configText)).use {
+            val config = BufferedReader(StringReader(withInterfaceMtu(configText))).use {
                 Config.parse(it)
             }
             b.setState(tunnel, Tunnel.State.UP, config)

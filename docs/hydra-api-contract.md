@@ -576,3 +576,14 @@ Notes:
   the Hydra tunnel up disconnects any other VPN on the device, and the first
   activation shows a system consent dialog that someone must accept on the
   headset.
+
+
+## Correction to section 8 (2026-08-25, learned on hardware)
+
+Do not compare the stream block against the single resolved host. A mesh
+session streams from the body's wireguard_ip while the server's stream block
+carries the venue LAN IP in stream_url_lan; comparing one host string reads
+every mesh stream as a changed assignment and kills it on the next tick.
+Compare against the body's FULL candidate host set plus the app name, and
+treat a stream block that matches an ended self-service session as stale:
+delete it, never relaunch from it.

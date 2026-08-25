@@ -88,6 +88,17 @@ class HydraStreamHooks(
     /** Set when stopStream initiated the teardown itself. */
     private val expectedStop = AtomicBoolean(false)
 
+    /**
+     * True when the host lies in 10.10.0.0/16: the WireGuard mesh, routed
+     * through the hydraguard hub over a 1420-MTU tunnel. Mesh streams use
+     * the mesh bitrate and Moonlight's remote tuning (1024-byte video
+     * packets instead of the 1392-byte LAN size, STREAM_CFG_REMOTE
+     * instead of AUTO). The measured hub path is 42-146 ms RTT with heavy
+     * jitter, which is exactly the profile the remote settings exist for,
+     * and 1024-byte payloads stay under the tunnel MTU with margin.
+     */
+    private fun isMeshHost(host: String): Boolean = host.startsWith("10.10.")
+
     // ------------------------------------------------------------------
     // StreamHooks
     // ------------------------------------------------------------------
@@ -164,6 +175,19 @@ class HydraStreamHooks(
 
             val details = http.getComputerDetails(serverInfo)
             val intent = buildGameIntent(host, http.getHttpsPort(serverInfo), app, details, serverCert)
+
+            // One logcat line per launch so a session is diagnosable from
+            // adb alone (the connection callbacks log under the same tag).
+            val mesh = isMeshHost(host)
+            Log.i(
+                "HydraStream",
+                "launching stream: host=$host route=${if (mesh) "mesh" else "lan"}" +
+                    " packetSize=${if (mesh) 1024 else 1392}" +
+                    " bitrateKbps=${if (mesh) BITRATE_WIREGUARD_KBPS else BITRATE_LAN_KBPS}" +
+                    " app=${app.appName}" +
+                    " res=${experience.streamWidth}x${experience.streamHeight}" +
+                    " fps=$STREAM_FPS"
+            )
             appContext.startActivity(intent)
 
             // Established from Hydra's point of view: pairing done, session
@@ -288,7 +312,7 @@ class HydraStreamHooks(
      */
     @Suppress("DEPRECATION")
     private fun writeStreamPreferences(experience: Experience, host: String) {
-        val bitrate = if (host.startsWith("10.10.")) BITRATE_WIREGUARD_KBPS else BITRATE_LAN_KBPS
+        val bitrate = if (isMeshHost(host)) BITRATE_WIREGUARD_KBPS else BITRATE_LAN_KBPS
         val prefs = android.preference.PreferenceManager.getDefaultSharedPreferences(appContext)
         prefs.edit()
             .putString(PREF_RESOLUTION, "${experience.streamWidth}x${experience.streamHeight}")
@@ -321,6 +345,8 @@ class HydraStreamHooks(
         }
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         intent.putExtra(Game.EXTRA_HOST, host)
+        // Mesh hosts stream with Moonlight's remote profile; see isMeshHost.
+        intent.putExtra(Game.EXTRA_HYDRA_REMOTE_TUNED, isMeshHost(host))
         intent.putExtra(Game.EXTRA_PORT, NvHTTP.DEFAULT_HTTP_PORT)
         intent.putExtra(Game.EXTRA_HTTPS_PORT, httpsPort)
         intent.putExtra(Game.EXTRA_APP_NAME, app.appName)
