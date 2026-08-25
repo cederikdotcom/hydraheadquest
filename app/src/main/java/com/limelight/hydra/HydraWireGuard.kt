@@ -210,6 +210,10 @@ class HydraWireGuard(context: Context) {
             b.setState(tunnel, Tunnel.State.UP, config)
             lastError = null
             Log.i(TAG, "tunnel up")
+            // Pin the process while the tunnel is up: without this,
+            // Android reaps the backgrounded kiosk (and the tunnel)
+            // whenever another app, e.g. the ALVR client, is fullscreen.
+            HydraTunnelService.start(appContext)
             true
         } catch (t: Throwable) {
             // BadConfigException, BackendException (VPN_NOT_AUTHORIZED,
@@ -227,6 +231,7 @@ class HydraWireGuard(context: Context) {
         return try {
             b.setState(tunnel, Tunnel.State.DOWN, null)
             Log.i(TAG, "tunnel down")
+            HydraTunnelService.stop(appContext)
             true
         } catch (t: Throwable) {
             lastError = t.message ?: t.javaClass.simpleName
