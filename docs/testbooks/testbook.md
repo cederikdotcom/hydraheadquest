@@ -187,3 +187,26 @@ enrollment time by hydracluster through hydraguard).
 4. Off-venue stream test: with the tunnel up, start an experience.
    Expected: LAN probe fails, mesh probe to the body wireguard_ip
    succeeds, pairing and stream proceed over 10.10.0.0/16.
+
+
+## Diagnostics (v0.7.0+)
+
+In-stream panel:
+1. During a stream, wake the pointer and look below the screen. The
+   move bar shows three buttons: info, environment, exit X.
+2. Pinch or click the info button. A dark card appears left of the
+   screen: Route, Body, Codec, Stream, Bitrate, RTT and variance,
+   FPS incoming and rendered, Net drops, Host latency avg and
+   min-max, Decode time. Values update every second.
+3. Expected on a mesh body: Route mesh, Bitrate 20.0 Mbps.
+4. Click info again to dismiss.
+
+Operator 5-step run (Operator, PIN 1337, Diagnostics):
+1. Tap Run diagnostics. Five steps run in order: Cluster connection,
+   Experience catalog, Body available, Body reachable, WireGuard
+   routing. Healthy result: five green checks and "All checks
+   passed".
+2. Step 4 probes hosts in the same order a stream start would (LAN
+   first, then mesh). Step 5 shows the mesh probe plus the local
+   tunnel state.
+3. Report issue after a run includes the step results in the report.
