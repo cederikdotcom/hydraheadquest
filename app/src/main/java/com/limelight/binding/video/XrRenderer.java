@@ -1194,27 +1194,58 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                     { "Decode time", na },
             };
         }
+        // Deliberately verbose: v0.7.0 built this table with conditional
+        // expressions inside the array initializer and ART's verifier
+        // rejected the method (copy1 type=Undefined) at class load, taking
+        // the whole XrRenderer class and the app down. Plain locals only.
         boolean hasRtt = d.rttMs > 0 || d.rttVarianceMs > 0;
+        String route = na;
+        if (d.route != null) route = d.route;
+        String body = na;
+        if (d.bodyHost != null) body = d.bodyHost;
+        String codec = na;
+        if (d.codec != null) codec = d.codec;
+        String stream = na;
+        if (d.width > 0) {
+            stream = d.width + "x" + d.height + " @ " + d.targetFps;
+        }
+        String bitrate = na;
+        if (d.bitrateKbps > 0) {
+            bitrate = String.format("%.1f Mbps", d.bitrateKbps / 1000.0f);
+        }
+        String rtt = na;
+        String rttVar = na;
+        if (hasRtt) {
+            rtt = d.rttMs + " ms";
+            rttVar = d.rttVarianceMs + " ms";
+        }
+        String fpsIn = String.format("%.1f", d.incomingFps);
+        String fpsOut = String.format("%.1f", d.renderedFps);
+        String drops = String.format("%.1f %%", d.netDropPercent);
+        String hostAvg = na;
+        String hostMinMax = na;
+        if (d.hasHostLatency) {
+            hostAvg = String.format("%.1f ms", d.hostLatencyAvgMs);
+            hostMinMax = String.format("%.1f / %.1f ms", d.hostLatencyMinMs, d.hostLatencyMaxMs);
+        }
+        String decode = na;
+        if (d.decodeTimeMs >= 0.0f) {
+            decode = String.format("%.1f ms", d.decodeTimeMs);
+        }
         return new String[][] {
-                { "Route", d.route != null ? d.route : na },
-                { "Body", d.bodyHost != null ? d.bodyHost : na },
-                { "Codec", d.codec != null ? d.codec : na },
-                { "Stream", d.width > 0
-                        ? d.width + "x" + d.height + " @ " + d.targetFps : na },
-                { "Bitrate", d.bitrateKbps > 0
-                        ? String.format("%.1f Mbps", d.bitrateKbps / 1000.0f) : na },
-                { "RTT", hasRtt ? d.rttMs + " ms" : na },
-                { "RTT variance", hasRtt ? d.rttVarianceMs + " ms" : na },
-                { "FPS incoming", String.format("%.1f", d.incomingFps) },
-                { "FPS rendered", String.format("%.1f", d.renderedFps) },
-                { "Net drops", String.format("%.1f %%", d.netDropPercent) },
-                { "Host latency", d.hasHostLatency
-                        ? String.format("%.1f ms", d.hostLatencyAvgMs) : na },
-                { "Host min / max", d.hasHostLatency
-                        ? String.format("%.1f / %.1f ms", d.hostLatencyMinMs, d.hostLatencyMaxMs)
-                        : na },
-                { "Decode time", d.decodeTimeMs >= 0.0f
-                        ? String.format("%.1f ms", d.decodeTimeMs) : na },
+                { "Route", route },
+                { "Body", body },
+                { "Codec", codec },
+                { "Stream", stream },
+                { "Bitrate", bitrate },
+                { "RTT", rtt },
+                { "RTT variance", rttVar },
+                { "FPS incoming", fpsIn },
+                { "FPS rendered", fpsOut },
+                { "Net drops", drops },
+                { "Host latency", hostAvg },
+                { "Host min / max", hostMinMax },
+                { "Decode time", decode },
         };
     }
 
