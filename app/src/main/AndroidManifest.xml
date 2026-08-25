@@ -10,8 +10,12 @@
     <!-- Horizon OS refuses to route immersive frames for apps that do not
          declare an HzOS SDK version since around the v77 update. Other
          platforms ignore this namespace entirely -->
+    <!-- minSdkVersion lowered from upstream's 77: the declaration only has
+         to be PRESENT on v77+ devices; a floor of 77 blocks installs on
+         Quest 2 units still on v76 (seen 2026-08-25). 74 keeps older
+         fleet Quest 2s installable while v77+ devices get the declaration -->
     <horizonos:uses-horizonos-sdk
-        horizonos:minSdkVersion="77"
+        horizonos:minSdkVersion="74"
         horizonos:targetSdkVersion="77" />
 
     <uses-permission android:name="android.permission.INTERNET" />
