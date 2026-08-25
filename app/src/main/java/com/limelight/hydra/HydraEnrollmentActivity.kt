@@ -3,6 +3,7 @@ package com.limelight.hydra
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.SurfaceTexture
 import android.os.Build
@@ -371,8 +372,11 @@ class HydraEnrollmentActivity : Activity(), HydraQrScanner.Listener {
                 runOnUiThread {
                     refreshStatus()
                     statusView.text = "Enrolled as head ${config.headId} (name: $name)"
-                    // TODO(#544): hand off to the catalog grid activity and
-                    // start HydraState (30 s tick + 3 s command poll).
+                    // Adopt the fresh enrollment (starts the 30 s tick and
+                    // 3 s command poll) and hand off to the kiosk routing.
+                    HydraApp.state(this).ensureStarted()
+                    startActivity(Intent(this, HydraLaunchActivity::class.java))
+                    finish()
                 }
             } catch (e: IOException) {
                 runOnUiThread {

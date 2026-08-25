@@ -30,3 +30,8 @@
 # jMDNS
 -dontwarn javax.jmdns.impl.DNSCache
 -dontwarn org.slf4j.**
+
+# WireGuard tunnel library (issue #544 Phase 2). GoBackend bridges to
+# libwg-go over JNI; keep the backend classes intact under shrinking.
+-keep class com.wireguard.android.backend.** {*;}
+-dontwarn com.wireguard.**

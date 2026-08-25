@@ -41,6 +41,10 @@ class HydraApp : Application() {
     lateinit var streamHooks: HydraStreamHooks
         private set
 
+    /** The Hydra mesh tunnel (issue #544 Phase 2). */
+    lateinit var hydraWireGuard: HydraWireGuard
+        private set
+
     /** The currently resumed activity, for screenshot capture. */
     @Volatile
     var currentActivity: Activity? = null
@@ -64,10 +68,12 @@ class HydraApp : Application() {
     override fun onCreate() {
         super.onCreate()
 
+        hydraWireGuard = HydraWireGuard(this)
         hydraState = HydraState(this, HydraConfigStore(this))
         streamHooks = HydraStreamHooks(this, hydraState)
         hydraState.streamHooks = streamHooks
         hydraState.moonlightClientIdProvider = { moonlightClientId }
+        hydraState.wireguardStatusProvider = { hydraWireGuard.statusString() }
         hydraState.screenshotProvider = {
             currentActivity?.let { HydraScreenshot.capture(it) }
         }
@@ -100,5 +106,24 @@ class HydraApp : Application() {
         // With a stored enrollment this starts the timers immediately;
         // otherwise the head waits in unconfigured for enrollment.
         hydraState.start()
+
+        // A stored WireGuard config only exists after an enrolled head
+        // fetched it via the operator menu. Bring the tunnel back up in
+        // the background when the one-time VPN consent is already granted
+        // (prepareIntent null). With consent missing the status reads
+        // consent-needed and an operator must use the WireGuard action.
+        Thread({
+            try {
+                if (hydraWireGuard.hasStoredConfig() &&
+                    hydraWireGuard.prepareIntent() == null
+                ) {
+                    hydraWireGuard.bringUpStored()
+                }
+            } catch (t: Throwable) {
+                // Never let the tunnel take the kiosk down (Horizon OS
+                // support is exactly what Phase 2 tests).
+                Log.w(TAG, "wireguard auto bring-up failed: ${t.message}")
+            }
+        }, "HydraWgStart").start()
     }
 }

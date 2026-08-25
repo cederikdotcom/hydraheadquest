@@ -275,6 +275,19 @@
             android:name=".binding.input.driver.UsbDriverService"
             android:label="Usb Driver Service" />
 
+        <!-- Hydra mesh tunnel (issue #544 Phase 2). The wireguard-android
+             tunnel library does not declare its VpnService itself; the
+             consumer app must. BIND_VPN_SERVICE restricts binding to the
+             system. Do not duplicate this entry -->
+        <service
+            android:name="com.wireguard.android.backend.GoBackend$VpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+
         <!-- Hydra kiosk launcher (issue #544). Routes to enrollment when
              unconfigured and to the catalog when enrolled. An additional
              launcher entry so upstream's PcView stays reachable for

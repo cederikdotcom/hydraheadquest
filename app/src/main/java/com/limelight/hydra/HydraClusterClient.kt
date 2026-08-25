@@ -63,7 +63,8 @@ class HydraClusterClient(private val config: EnrollmentConfig) {
             bearerToken: String,
             body: ByteArray?,
             contentType: String?,
-            timeoutMs: Int
+            timeoutMs: Int,
+            accept: String = "application/json"
         ): ByteArray {
             val conn = URL(url).openConnection() as HttpURLConnection
             try {
@@ -71,7 +72,7 @@ class HydraClusterClient(private val config: EnrollmentConfig) {
                 conn.connectTimeout = timeoutMs
                 conn.readTimeout = timeoutMs
                 conn.setRequestProperty("Authorization", "Bearer $bearerToken")
-                conn.setRequestProperty("Accept", "application/json")
+                conn.setRequestProperty("Accept", accept)
                 if (body != null) {
                     if (contentType != null) {
                         conn.setRequestProperty("Content-Type", contentType)
@@ -161,6 +162,34 @@ class HydraClusterClient(private val config: EnrollmentConfig) {
         query.append("&experience=").append(encode(experience))
         val response = request("GET", query.toString(), null, null, REQUEST_TIMEOUT_MS)
         return EligibleBody.listFromJson(String(response, StandardCharsets.UTF_8))
+    }
+
+    /**
+     * GET /api/v1/heads/{head_id}/wireguard-config
+     *
+     * Returns the ready-made wg-quick config as plain text. The body carries
+     * this head's PRIVATE KEY: never log it, store it app-private only.
+     * Throws on any non-200; a 404 means no tunnel is provisioned for this
+     * head. An empty body is treated as not provisioned too (contract
+     * section 12). Fetch once, reuse across launches, refetch only on
+     * explicit operator action.
+     */
+    @Throws(IOException::class)
+    fun getWireguardConfig(): String {
+        val response = rawRequest(
+            url = config.baseUrl + "$headPath/wireguard-config",
+            method = "GET",
+            bearerToken = config.token,
+            body = null,
+            contentType = null,
+            timeoutMs = REQUEST_TIMEOUT_MS,
+            accept = "text/plain"
+        )
+        val text = String(response, StandardCharsets.UTF_8)
+        if (text.isBlank()) {
+            throw IOException("wireguard-config: empty body (not provisioned)")
+        }
+        return text
     }
 
     /** GET /api/v1/heads/{head_id}/commands, polled every 3 s. */

@@ -50,6 +50,9 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
 
         private const val GRID_COLUMNS = 3
 
+        /** startActivityForResult code for the system VPN consent dialog. */
+        private const val REQUEST_WIREGUARD_CONSENT = 4720
+
         private const val COLOR_BACKGROUND = 0xFF0E0E12.toInt()
         private const val COLOR_TILE = 0xFF26262E.toInt()
         private const val COLOR_TEXT_DIM = 0xFF9A9AA5.toInt()
@@ -357,6 +360,7 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
     /** Destructive and debug actions, already behind the PIN gate. */
     private fun showOperatorActions() {
         val actions = arrayOf(
+            "WireGuard",
             "Open Moonlight UI",
             "Open enrollment screen",
             "Reset enrollment"
@@ -365,12 +369,101 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
             .setTitle("Operator actions")
             .setItems(actions) { _, which ->
                 when (which) {
-                    0 -> startActivity(Intent(this, PcView::class.java))
-                    1 -> startActivity(Intent(this, HydraEnrollmentActivity::class.java))
-                    2 -> confirmReset()
+                    0 -> startWireGuardAction()
+                    1 -> startActivity(Intent(this, PcView::class.java))
+                    2 -> startActivity(Intent(this, HydraEnrollmentActivity::class.java))
+                    3 -> confirmReset()
                 }
             }
             .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // ------------------------------------------------------------------
+    // WireGuard operator action (issue #544 Phase 2)
+    // ------------------------------------------------------------------
+
+    /**
+     * Fetch the config when none is stored, ask for the one-time system
+     * VPN consent when needed, then bring the tunnel up and show status.
+     */
+    private fun startWireGuardAction() {
+        val wireGuard = HydraApp.from(this).hydraWireGuard
+        Toast.makeText(this, "WireGuard: working...", Toast.LENGTH_SHORT).show()
+        thread(name = "HydraWgAction") {
+            if (!wireGuard.hasStoredConfig()) {
+                val configText = try {
+                    hydraState.fetchWireguardConfig()
+                } catch (e: Exception) {
+                    val message = e.message ?: "fetch failed"
+                    val display = if (
+                        message.contains("HTTP 404") ||
+                        message.contains("not provisioned")
+                    ) {
+                        "Not provisioned. An admin must provision this " +
+                            "head on hydraguard, then retry."
+                    } else {
+                        // Never echo config content; this is an error only.
+                        "Config fetch failed: $message"
+                    }
+                    runOnUiThread { showWireGuardDialog(display) }
+                    return@thread
+                }
+                try {
+                    wireGuard.storeConfig(configText)
+                } catch (e: Exception) {
+                    runOnUiThread {
+                        showWireGuardDialog("Config store failed: ${e.message}")
+                    }
+                    return@thread
+                }
+            }
+            val consent = wireGuard.prepareIntent()
+            if (consent != null) {
+                runOnUiThread {
+                    startActivityForResult(consent, REQUEST_WIREGUARD_CONSENT)
+                }
+            } else {
+                connectWireGuardAndReport(wireGuard)
+            }
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_WIREGUARD_CONSENT) return
+        if (resultCode == RESULT_OK) {
+            val wireGuard = HydraApp.from(this).hydraWireGuard
+            thread(name = "HydraWgAction") {
+                connectWireGuardAndReport(wireGuard)
+            }
+        } else {
+            showWireGuardDialog(
+                "VPN consent was denied. The tunnel stays down until an " +
+                    "operator runs the WireGuard action again and accepts."
+            )
+        }
+    }
+
+    /** Background: bring the tunnel up, wait a moment, report status. */
+    private fun connectWireGuardAndReport(wireGuard: HydraWireGuard) {
+        wireGuard.bringUpStored()
+        // Give the first handshake a moment so the status is meaningful.
+        try {
+            Thread.sleep(2000)
+        } catch (ignored: InterruptedException) {
+        }
+        val report = "status: ${wireGuard.statusString()}\n" +
+            wireGuard.lastHandshakeDescription()
+        runOnUiThread { showWireGuardDialog(report) }
+    }
+
+    private fun showWireGuardDialog(message: String) {
+        if (isFinishing) return
+        AlertDialog.Builder(this)
+            .setTitle("WireGuard")
+            .setMessage(message)
+            .setPositiveButton("Close", null)
             .show()
     }
 

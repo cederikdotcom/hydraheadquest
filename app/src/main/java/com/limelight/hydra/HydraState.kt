@@ -170,6 +170,17 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
     @Volatile
     var moonlightClientIdProvider: (() -> String?)? = null
 
+    /**
+     * Supplies the live WireGuard tunnel status for heartbeat diagnostics.
+     * HydraApp wires this to HydraWireGuard.statusString(). "disabled"
+     * before wiring, matching the no-config state.
+     */
+    @Volatile
+    var wireguardStatusProvider: (() -> String)? = null
+
+    // Volatile: written on the executor, also read by the operator UI
+    // thread (fetchWireguardConfig).
+    @Volatile
     private var client: HydraClusterClient? = null
 
     @Volatile
@@ -229,6 +240,18 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
 
     /** This head's id, or null when unenrolled. */
     fun currentHeadId(): String? = enrollment?.headId
+
+    /**
+     * Fetch this head's wg-quick config from the cluster (contract section
+     * 12). Explicit operator action only; the stored config is reused on
+     * every other path. Blocking; call off the main thread. The returned
+     * text contains the private key: never log it.
+     */
+    @Throws(IOException::class)
+    fun fetchWireguardConfig(): String {
+        val apiClient = client ?: throw IOException("Head is not enrolled")
+        return apiClient.getWireguardConfig()
+    }
 
     /** Adopt a fresh enrollment (called right after enroll succeeds). */
     fun onEnrolled(config: EnrollmentConfig) {
@@ -595,11 +618,14 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
         } catch (e: Exception) {
             null
         }
+        val wireguardStatus = try {
+            wireguardStatusProvider?.invoke() ?: "disabled"
+        } catch (e: Exception) {
+            "error: ${e.message ?: "status failed"}".take(70)
+        }
         return HeadDiagnostics(
             version = "v" + BuildConfig.VERSION_NAME,
-            // TODO(#544): Phase 2, report the wireguard-android tunnel state
-            // once the VpnService path is verified on Horizon OS.
-            wireguard = "disabled",
+            wireguard = wireguardStatus,
             routing = routing,
             latencyMs = latency,
             wifiSsid = currentSsid(),
