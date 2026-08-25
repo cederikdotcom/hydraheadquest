@@ -80,13 +80,18 @@ object HydraUi {
      */
     @Volatile
     private var cachedScale = 0f
+    @Volatile
+    private var cachedWidth = 0
 
     fun scale(context: Context): Float {
-        val cached = cachedScale
-        if (cached > 0f) return cached
         val width = context.resources.displayMetrics.widthPixels
         if (width > 0) {
+            // Keyed on the width: the panel can first report a portrait
+            // width and re-lay out landscape a moment later, and a scale
+            // cached from the first reading would stick forever
+            if (width == cachedWidth && cachedScale > 0f) return cachedScale
             val computed = (width / 1600f).coerceIn(1f, 3f)
+            cachedWidth = width
             cachedScale = computed
             return computed
         }

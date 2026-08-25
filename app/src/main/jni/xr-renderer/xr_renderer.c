@@ -101,6 +101,8 @@
 #define IN_POSE     8
 // The cell just chosen in the environment grid, or -1
 #define IN_PICKER_PICK 17
+// Set to 1 on the frame the exit button is clicked. Java ends the stream.
+#define IN_EXIT     18
 #define IN_SLOTS    20
 
 // Grab thresholds for the grip, and the range a resize is allowed to reach
@@ -157,6 +159,16 @@
 #define HOVER_PICKER    5
 // Nothing under the ray, but close enough to the screen to keep drawing it
 #define HOVER_HALO      6
+// The exit button, mirrored on the right of the move bar. Clicking it ends
+// the stream, which is the only way out for a user with no controllers.
+#define HOVER_EXITBUTTON 7
+
+// Hand presence layer. Joints drawn as soft translucent dots into the one
+// projection layer this renderer owns. Half the recommended eye resolution
+// is plenty for featureless blobs and keeps the render pass cheap.
+#define HAND_LAYER_RES_DIV 2
+#define HAND_NEAR_M 0.05f
+#define HAND_FAR_M  100.0f
 // How far past each edge that reaches, as a fraction of the screen
 #define HALO_FRAC 0.5f
 // How far the ray runs when it is aimed at nothing at all, in metres
@@ -398,6 +410,10 @@ typedef struct {
     // arrives as a status bit beside the joints, not as an action
     int fbAim;
     int aimMenuPressed[HAND_COUNT];
+    // Last aim status flags per hand, logged once per second so a dead menu
+    // gesture shows its reason in logcat instead of just doing nothing
+    uint64_t aimStatus[HAND_COUNT];
+    long aimLogNs[HAND_COUNT];
     // Looking at something instead of pointing at it. Lowest priority of the
     // three, so a controller or a hand always wins when one is aiming.
     int eyeGaze;
@@ -415,6 +431,14 @@ typedef struct {
     // offer a pointer pose of their own
     XrPosef handRay[HAND_COUNT];
     int handRayValid[HAND_COUNT];
+    // The full joint set stashed by the input pass, so the presence layer can
+    // draw the hands without a second locate call. One bit per joint.
+    uint32_t handJointMask[HAND_COUNT];
+    XrVector3f handJointPos[HAND_COUNT][XR_HAND_JOINT_COUNT_EXT];
+    float handJointRadius[HAND_COUNT][XR_HAND_JOINT_COUNT_EXT];
+    // The space the joints were located in, which the presence layer must
+    // also use as its base or the hands land in the wrong place
+    XrSpace handJointSpace;
     PFN_xrCreateHandTrackerEXT pfnCreateHandTracker;
     PFN_xrDestroyHandTrackerEXT pfnDestroyHandTracker;
     PFN_xrLocateHandJointsEXT pfnLocateHandJoints;
@@ -547,6 +571,38 @@ typedef struct {
     int pickerChoice;
     int pickerPick;
     int envButtonHot;
+
+    // The exit button, right of the move bar, mirroring the environment
+    // button. The belt and braces way out when the menu gesture fails.
+    XrSwapchain exitButtonSwapchain;
+    uint32_t exitButtonImageCount;
+    XrSwapchainImageOpenGLESKHR* exitButtonImages;
+    int exitButtonReady;
+    int exitButtonHot;
+
+    // Hand presence: joints drawn as translucent dots. The one projection
+    // layer in the renderer; everything else is composed by the compositor.
+    XrSwapchain handSwapchain;
+    uint32_t handImageCount;
+    XrSwapchainImageOpenGLESKHR* handImages;
+    int handEyeW;
+    int handEyeH;
+    GLuint handProgram;
+    GLint handMvpUniform;
+    GLint handPointScaleUniform;
+    GLuint handFbo;
+    // 0 untried, 1 ready, -1 failed so it is never retried every frame
+    int handLayerState;
+
+    // Fixed foveated rendering on the hand layer swapchain. FB path only.
+    // The video, environment and UI are compositor layers, which foveation
+    // cannot touch by definition, so the win is limited to what the app
+    // itself renders: today that is only the hand presence layer.
+    int fbFoveation;
+    XrFoveationProfileFB foveationProfile;
+    PFN_xrCreateFoveationProfileFB pfnCreateFoveationProfile;
+    PFN_xrDestroyFoveationProfileFB pfnDestroyFoveationProfile;
+    PFN_xrUpdateSwapchainFB pfnUpdateSwapchain;
 
     long statFrames;
     long statTotalNs;
@@ -928,6 +984,7 @@ static int initXrInstance(XrCtx* ctx) {
     xrEnumerateInstanceExtensionProperties(NULL, extCount, &extCount, exts);
 
     int haveGles = 0, haveAndroidCreate = 0;
+    int haveFbFoveation = 0, haveFbFoveationConfig = 0, haveFbSwapchainUpdate = 0;
     LOGI("runtime offers %u OpenXR extensions", extCount);
     for (uint32_t i = 0; i < extCount; i++) {
         LOGI("  extension %s", exts[i].extensionName);
@@ -941,6 +998,9 @@ static int initXrInstance(XrCtx* ctx) {
         if (!strcmp(exts[i].extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME)) ctx->handTracking = 1;
         if (!strcmp(exts[i].extensionName, XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME)) ctx->eyeGaze = 1;
         if (!strcmp(exts[i].extensionName, XR_FB_HAND_TRACKING_AIM_EXTENSION_NAME)) ctx->fbAim = 1;
+        if (!strcmp(exts[i].extensionName, XR_FB_FOVEATION_EXTENSION_NAME)) haveFbFoveation = 1;
+        if (!strcmp(exts[i].extensionName, XR_FB_FOVEATION_CONFIGURATION_EXTENSION_NAME)) haveFbFoveationConfig = 1;
+        if (!strcmp(exts[i].extensionName, XR_FB_SWAPCHAIN_UPDATE_STATE_EXTENSION_NAME)) haveFbSwapchainUpdate = 1;
     }
     free(exts);
 
@@ -949,7 +1009,7 @@ static int initXrInstance(XrCtx* ctx) {
         return 0;
     }
 
-    const char* enabledExts[10];
+    const char* enabledExts[16];
     uint32_t enabledCount = 0;
     enabledExts[enabledCount++] = XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME;
     enabledExts[enabledCount++] = XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME;
@@ -984,6 +1044,15 @@ static int initXrInstance(XrCtx* ctx) {
     else {
         ctx->fbAim = 0;
     }
+    // Fixed foveation for the hand presence layer. Applying a profile goes
+    // through xrUpdateSwapchainFB, so all three have to be there together.
+    ctx->fbFoveation = haveFbFoveation && haveFbFoveationConfig && haveFbSwapchainUpdate;
+    if (ctx->fbFoveation) {
+        enabledExts[enabledCount++] = XR_FB_FOVEATION_EXTENSION_NAME;
+        enabledExts[enabledCount++] = XR_FB_FOVEATION_CONFIGURATION_EXTENSION_NAME;
+        enabledExts[enabledCount++] = XR_FB_SWAPCHAIN_UPDATE_STATE_EXTENSION_NAME;
+    }
+    LOGI("FB foveation %s", ctx->fbFoveation ? "enabled" : "not offered by this runtime");
 
     XrInstanceCreateInfoAndroidKHR androidInfo = { XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR };
     androidInfo.applicationVM = ctx->vm;
@@ -1811,7 +1880,8 @@ static void suggestBindings(XrCtx* ctx, const char* profile, int full) {
 
     XrResult res = xrSuggestInteractionProfileBindings(ctx->instance, &suggest);
     if (XR_SUCCEEDED(res)) {
-        LOGI("bindings accepted for %s (%s)", profile, full ? "full" : "reduced");
+        LOGI("bindings accepted for %s (%s, XrResult %d, %u paths)",
+             profile, full ? "full" : "reduced", res, n);
     }
     else if (full) {
         LOGW("full bindings rejected for %s (%d), trying aim and trigger only", profile, res);
@@ -1857,7 +1927,12 @@ static XrResult trySuggestHands(XrCtx* ctx, const char* profile, const char* aim
     suggest.countSuggestedBindings = n;
     suggest.suggestedBindings = b;
 
-    return xrSuggestInteractionProfileBindings(ctx->instance, &suggest);
+    XrResult res = xrSuggestInteractionProfileBindings(ctx->instance, &suggest);
+    // Every attempt logged with its XrResult, so a rejected path shows up in
+    // logcat instead of silently downgrading the hands
+    LOGI("hand suggestion %s aim=%s click=%s grasp=%s: XrResult %d",
+         profile, aim, click != NULL ? click : "-", grasp != NULL ? grasp : "-", res);
+    return res;
 }
 
 // Runtimes that offer the hand profile do not all implement every input in it,
@@ -2173,6 +2248,7 @@ static int jointPinching(XrCtx* ctx, int hand, XrSpace space, const XrPosef* hea
     if (!ctx->jointTracking || ctx->handTrackers[hand] == XR_NULL_HANDLE) {
         ctx->handRayValid[hand] = 0;
         ctx->aimMenuPressed[hand] = 0;
+        ctx->handJointMask[hand] = 0;
         return 0;
     }
 
@@ -2196,11 +2272,35 @@ static int jointPinching(XrCtx* ctx, int hand, XrSpace space, const XrPosef* hea
         ctx->pinchPointValid[hand] = 0;
         ctx->handRayValid[hand] = 0;
         ctx->aimMenuPressed[hand] = 0;
+        ctx->handJointMask[hand] = 0;
         return 0;
     }
 
     ctx->aimMenuPressed[hand] = ctx->fbAim
             && (aimState.status & XR_HAND_TRACKING_AIM_MENU_PRESSED_BIT_FB) != 0;
+    ctx->aimStatus[hand] = ctx->fbAim ? (uint64_t)aimState.status : 0;
+
+    // Once per second per tracked hand, so the next logcat says whether the
+    // runtime ever raises MENU_PRESSED and which flags come with it
+    long nowLog = nowNs();
+    if (nowLog - ctx->aimLogNs[hand] > 1000000000L) {
+        ctx->aimLogNs[hand] = nowLog;
+        LOGI("hand %d tracked, fbAim %d, aim status 0x%llx, menu %d, pinch %d",
+             hand, ctx->fbAim, (unsigned long long)ctx->aimStatus[hand],
+             ctx->aimMenuPressed[hand], ctx->jointPinch[hand]);
+    }
+
+    // Stash the joints for the presence layer, one bit per valid joint
+    uint32_t mask = 0;
+    for (uint32_t j = 0; j < XR_HAND_JOINT_COUNT_EXT; j++) {
+        if (joints[j].locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) {
+            mask |= 1u << j;
+            ctx->handJointPos[hand][j] = joints[j].pose.position;
+            ctx->handJointRadius[hand][j] = joints[j].radius;
+        }
+    }
+    ctx->handJointMask[hand] = mask;
+    ctx->handJointSpace = space;
 
     if (headValid) {
         buildHandRay(ctx, hand, head, joints);
@@ -2384,6 +2484,23 @@ static int createPointerSwapchain(XrCtx* ctx) {
     }
     else {
         ctx->outlineSwapchain = XR_NULL_HANDLE;
+    }
+
+    // Same square art size as the environment button
+    if (checkXr(xrCreateSwapchain(ctx->session, &info, &ctx->exitButtonSwapchain),
+                "create exit button swapchain")) {
+        xrEnumerateSwapchainImages(ctx->exitButtonSwapchain, 0, &ctx->exitButtonImageCount, NULL);
+        ctx->exitButtonImages = calloc(ctx->exitButtonImageCount,
+                                       sizeof(XrSwapchainImageOpenGLESKHR));
+        for (uint32_t i = 0; i < ctx->exitButtonImageCount; i++) {
+            ctx->exitButtonImages[i].type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR;
+        }
+        xrEnumerateSwapchainImages(ctx->exitButtonSwapchain, ctx->exitButtonImageCount,
+                                   &ctx->exitButtonImageCount,
+                                   (XrSwapchainImageBaseHeader*)ctx->exitButtonImages);
+    }
+    else {
+        ctx->exitButtonSwapchain = XR_NULL_HANDLE;
     }
 
     info.width = CORNER_TEX_W;
@@ -2837,6 +2954,25 @@ static int envButtonHit(XrCtx* ctx, float u, float v, float height) {
     return fabsf(u - cu) < halfU && fabsf(v - cv) < halfV;
 }
 
+// The exit button mirrors the environment button on the other side of the
+// move bar, so the two ends of the bar read as a pair of controls
+static void exitButtonPlacement(XrCtx* ctx, float height, Vec3* outLocal, float* outSide) {
+    envButtonPlacement(ctx, height, outLocal, outSide);
+    outLocal->x = -outLocal->x;
+}
+
+static int exitButtonHit(XrCtx* ctx, float u, float v, float height) {
+    Vec3 local;
+    float side;
+    exitButtonPlacement(ctx, height, &local, &side);
+
+    float cu = 0.5f + local.x / ctx->screenWidth;
+    float cv = 0.5f - local.y / height;
+    float halfU = side * HOVER_MARGIN * 0.5f / ctx->screenWidth;
+    float halfV = side * HOVER_MARGIN * 0.5f / height;
+    return fabsf(u - cu) < halfU && fabsf(v - cv) < halfV;
+}
+
 // Where the ray lands on furniture rather than on the picture. The grid has a
 // plane of its own, everything else sits on the screen.
 static Vec3 furniturePoint(XrCtx* ctx, int hover, float u, float v, XrPosef screenPose,
@@ -2918,6 +3054,17 @@ static void destroyCtx(JNIEnv* env, XrCtx* ctx) {
         xrDestroySwapchain(ctx->outlineSwapchain);
     }
     free(ctx->outlineImages);
+    if (ctx->exitButtonSwapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(ctx->exitButtonSwapchain);
+    }
+    free(ctx->exitButtonImages);
+    if (ctx->foveationProfile != XR_NULL_HANDLE && ctx->pfnDestroyFoveationProfile != NULL) {
+        ctx->pfnDestroyFoveationProfile(ctx->foveationProfile);
+    }
+    if (ctx->handSwapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(ctx->handSwapchain);
+    }
+    free(ctx->handImages);
     if (ctx->localSpace != XR_NULL_HANDLE) {
         xrDestroySpace(ctx->localSpace);
     }
@@ -3448,11 +3595,17 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
         if (h < HAND_COUNT) {
             int wasDown = ctx->triggerDown[h];
             float value = actionFloat(ctx, ctx->triggerAction, h);
+            // The joint locate has to run every frame: it also carries the
+            // FB aim state with the system MENU_PRESSED bit. As the right
+            // operand of || it was skipped whenever the bound trigger was
+            // already high, which is exactly the frames where the menu
+            // pinch happens, so the gesture could never be seen. Call it
+            // first, unconditionally.
+            int pinched = jointPinching(ctx, h, space, &headLoc.pose, headValid);
             // Either a bound trigger or a measured pinch will do. Runtimes
             // that offer neither leave this at rest, which is what a headset
             // with nothing in its hands should report.
-            ctx->triggerDown[h] = value > (wasDown ? PRESS_OFF : PRESS_ON)
-                    || jointPinching(ctx, h, space, &headLoc.pose, headValid);
+            ctx->triggerDown[h] = value > (wasDown ? PRESS_OFF : PRESS_ON) || pinched;
             ctx->triggerEdge[h] = ctx->triggerDown[h] && !wasDown;
         }
         else if (!ctx->eyeGaze || !ctx->gazeEnabled
@@ -3488,6 +3641,10 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
             if ((hovers[h] == HOVER_NONE || hovers[h] == HOVER_BAR)
                     && envButtonHit(ctx, hitU[h], hitV[h], height)) {
                 hovers[h] = HOVER_ENVBUTTON;
+            }
+            if ((hovers[h] == HOVER_NONE || hovers[h] == HOVER_BAR)
+                    && exitButtonHit(ctx, hitU[h], hitV[h], height)) {
+                hovers[h] = HOVER_EXITBUTTON;
             }
         }
 
@@ -3586,6 +3743,10 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
     int menuNow = actionBool(ctx, ctx->menuAction, HAND_LEFT)
             || ctx->aimMenuPressed[HAND_LEFT] || ctx->aimMenuPressed[HAND_RIGHT];
     if (menuNow && !ctx->menuPrev) {
+        LOGI("menu press: action %d, aim left %d, aim right %d, picker %s",
+             actionBool(ctx, ctx->menuAction, HAND_LEFT),
+             ctx->aimMenuPressed[HAND_LEFT], ctx->aimMenuPressed[HAND_RIGHT],
+             ctx->pickerOpen ? "closing" : "opening");
         ctx->pickerOpen = !ctx->pickerOpen;
         // The picker needs an awake pointer to be aimed at, and the pinch
         // that carried the gesture must not also count as a click on it
@@ -3635,6 +3796,7 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
     // reaches the picture behind
     ctx->pickerHover = -1;
     ctx->envButtonHot = 0;
+    ctx->exitButtonHot = 0;
     ctx->pickerPick = -1;
     if (ctx->pickerOpen) {
         hover = HOVER_PICKER;
@@ -3685,6 +3847,14 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
         ctx->envButtonHot = 1;
         if (ctx->triggerEdge[hand]) {
             ctx->pickerOpen = 1;
+        }
+    }
+    else if (hover == HOVER_EXITBUTTON) {
+        ctx->exitButtonHot = 1;
+        if (ctx->triggerEdge[hand]) {
+            // Java ends the stream. Reported once, on the click edge.
+            LOGI("exit button clicked");
+            out[IN_EXIT] = 1.0f;
         }
     }
 
@@ -3785,8 +3955,8 @@ Java_com_limelight_binding_video_XrRenderer_nativeUpdateInput(JNIEnv* env, jobje
     // The bar, the button and the picker all sit off the picture, so pointing
     // at them must not drag the host cursor to the edge
     int hit = (hover == HOVER_SCREEN || hover == HOVER_CORNER) && hand != SRC_GAZE;
-    if ((hover == HOVER_BAR || hover == HOVER_ENVBUTTON || hover == HOVER_PICKER
-            || hover == HOVER_HALO) && headValid && hand >= 0) {
+    if ((hover == HOVER_BAR || hover == HOVER_ENVBUTTON || hover == HOVER_EXITBUTTON
+            || hover == HOVER_PICKER || hover == HOVER_HALO) && headValid && hand >= 0) {
         Vec3 end = furniturePoint(ctx, hover, hitU[hand], hitV[hand], screenPose,
                                   height, radius, curved);
         ctx->beamStart = aimPoses[hand].position;
@@ -4279,7 +4449,7 @@ static void renderVideoFrame(XrCtx* ctx, const float* texMatrix, float separatio
 JNIEXPORT void JNICALL
 Java_com_limelight_binding_video_XrRenderer_nativeUploadPicker(JNIEnv* env, jobject thiz,
                                                                jlong handle, jobject grid,
-                                                               jobject button) {
+                                                               jobject button, jobject exit) {
     XrCtx* ctx = (XrCtx*)(intptr_t)handle;
     if (ctx == NULL) {
         return;
@@ -4299,8 +4469,17 @@ Java_com_limelight_binding_video_XrRenderer_nativeUploadPicker(JNIEnv* env, jobj
                                                 OUTLINE_TEX, OUTLINE_TEX);
         }
     }
-    LOGI("picker art %s, button %s", ctx->pickerReady ? "ready" : "missing",
-         ctx->envButtonReady ? "ready" : "missing");
+    if (exit != NULL) {
+        const unsigned char* px = (*env)->GetDirectBufferAddress(env, exit);
+        if (px != NULL) {
+            ctx->exitButtonReady = uploadFlipped(ctx, ctx->exitButtonSwapchain,
+                                                 ctx->exitButtonImages, px,
+                                                 OUTLINE_TEX, OUTLINE_TEX);
+        }
+    }
+    LOGI("picker art %s, button %s, exit %s", ctx->pickerReady ? "ready" : "missing",
+         ctx->envButtonReady ? "ready" : "missing",
+         ctx->exitButtonReady ? "ready" : "missing");
 }
 
 // Which cell the picker is showing as chosen, so it survives a restart
@@ -4470,6 +4649,340 @@ Java_com_limelight_binding_video_XrRenderer_nativeGetWarpGpuMs(JNIEnv* env, jobj
     return ms;
 }
 
+// ---- Hand presence layer ----
+//
+// Upstream used the hands only as a pointer and drew nothing, so with the
+// controllers down the user saw no hands at all. This draws the 26 tracked
+// joints of each hand as soft translucent dots, batched into one point draw
+// per eye, in the single projection layer this renderer owns. The video, the
+// environment and the UI are all compositor layers and never pass through
+// here, so with controllers in hand this whole path costs nothing.
+
+static const char* HAND_VERTEX_SRC =
+    "#version 300 es\n"
+    // Joint centre in xyz, joint radius in metres in w
+    "in vec4 a_joint;\n"
+    "uniform mat4 u_mvp;\n"
+    // Pixels per metre at unit clip depth, so the dot tracks the real radius
+    "uniform float u_pointScale;\n"
+    "void main() {\n"
+    "    gl_Position = u_mvp * vec4(a_joint.xyz, 1.0);\n"
+    "    float w = max(gl_Position.w, 0.05);\n"
+    "    gl_PointSize = clamp(2.0 * a_joint.w * u_pointScale / w, 2.0, 128.0);\n"
+    "}\n";
+
+static const char* HAND_FRAGMENT_SRC =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "out vec4 fragColor;\n"
+    "void main() {\n"
+    "    vec2 d = gl_PointCoord - vec2(0.5);\n"
+    "    float r = length(d) * 2.0;\n"
+    "    float a = (1.0 - smoothstep(0.6, 1.0, r)) * 0.45;\n"
+    // Neutral grey, premultiplied, no lighting
+    "    fragColor = vec4(vec3(0.66) * a, a);\n"
+    "}\n";
+
+// Column-major projection from an OpenXR field of view
+static void handProjMatrix(XrFovf fov, float* m) {
+    float tanL = tanf(fov.angleLeft);
+    float tanR = tanf(fov.angleRight);
+    float tanU = tanf(fov.angleUp);
+    float tanD = tanf(fov.angleDown);
+    float w = tanR - tanL;
+    float h = tanU - tanD;
+    memset(m, 0, 16 * sizeof(float));
+    m[0] = 2.0f / w;
+    m[5] = 2.0f / h;
+    m[8] = (tanR + tanL) / w;
+    m[9] = (tanU + tanD) / h;
+    m[10] = -(HAND_FAR_M + HAND_NEAR_M) / (HAND_FAR_M - HAND_NEAR_M);
+    m[11] = -1.0f;
+    m[14] = -(2.0f * HAND_FAR_M * HAND_NEAR_M) / (HAND_FAR_M - HAND_NEAR_M);
+}
+
+// Inverse of a rigid pose: rows are the rotated basis vectors and the
+// translation is minus the position expressed in that basis
+static void handViewMatrix(const XrPosef* pose, float* m) {
+    Vec3 ex = { 1.0f, 0.0f, 0.0f };
+    Vec3 ey = { 0.0f, 1.0f, 0.0f };
+    Vec3 ez = { 0.0f, 0.0f, 1.0f };
+    Vec3 rx = quatRotate(pose->orientation, ex);
+    Vec3 ry = quatRotate(pose->orientation, ey);
+    Vec3 rz = quatRotate(pose->orientation, ez);
+    Vec3 p = { pose->position.x, pose->position.y, pose->position.z };
+    m[0] = rx.x; m[4] = rx.y; m[8]  = rx.z;
+    m[12] = -(rx.x * p.x + rx.y * p.y + rx.z * p.z);
+    m[1] = ry.x; m[5] = ry.y; m[9]  = ry.z;
+    m[13] = -(ry.x * p.x + ry.y * p.y + ry.z * p.z);
+    m[2] = rz.x; m[6] = rz.y; m[10] = rz.z;
+    m[14] = -(rz.x * p.x + rz.y * p.y + rz.z * p.z);
+    m[3] = 0.0f; m[7] = 0.0f; m[11] = 0.0f; m[15] = 1.0f;
+}
+
+// out = a * b, all column-major
+static void handMatMul(const float* a, const float* b, float* out) {
+    for (int c = 0; c < 4; c++) {
+        for (int r = 0; r < 4; r++) {
+            out[c * 4 + r] = a[0 * 4 + r] * b[c * 4 + 0]
+                           + a[1 * 4 + r] * b[c * 4 + 1]
+                           + a[2 * 4 + r] * b[c * 4 + 2]
+                           + a[3 * 4 + r] * b[c * 4 + 3];
+        }
+    }
+}
+
+// One-time setup: a side by side stereo swapchain at reduced resolution, the
+// point sprite program, and the FB fixed foveation profile when the runtime
+// offers one. Failure marks the state so nothing retries per frame.
+static void ensureHandLayer(XrCtx* ctx) {
+    if (ctx->handLayerState != 0) {
+        return;
+    }
+    ctx->handLayerState = -1;
+
+    XrViewConfigurationView views[2];
+    memset(views, 0, sizeof(views));
+    views[0].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
+    views[1].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
+    uint32_t viewCount = 0;
+    if (XR_FAILED(xrEnumerateViewConfigurationViews(ctx->instance, ctx->systemId,
+            XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 2, &viewCount, views))
+            || viewCount < 2) {
+        LOGW("hand layer: view configuration unavailable");
+        return;
+    }
+    ctx->handEyeW = (int)views[0].recommendedImageRectWidth / HAND_LAYER_RES_DIV;
+    ctx->handEyeH = (int)views[0].recommendedImageRectHeight / HAND_LAYER_RES_DIV;
+    if (ctx->handEyeW < 64 || ctx->handEyeH < 64) {
+        LOGW("hand layer: eye size %dx%d too small", ctx->handEyeW, ctx->handEyeH);
+        return;
+    }
+
+    XrSwapchainCreateInfo info = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
+    // Fixed foveation wants to know at creation time. GLES uses the scaled
+    // bin flavour; the fragment density map flavour is Vulkan only.
+    XrSwapchainCreateInfoFoveationFB fovCreate = { XR_TYPE_SWAPCHAIN_CREATE_INFO_FOVEATION_FB };
+    if (ctx->fbFoveation) {
+        fovCreate.flags = XR_SWAPCHAIN_CREATE_FOVEATION_SCALED_BIN_BIT_FB;
+        info.next = &fovCreate;
+    }
+    info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    info.format = ctx->swapchainFormat;
+    info.sampleCount = 1;
+    info.width = ctx->handEyeW * 2;
+    info.height = ctx->handEyeH;
+    info.faceCount = 1;
+    info.arraySize = 1;
+    info.mipCount = 1;
+    if (!checkXr(xrCreateSwapchain(ctx->session, &info, &ctx->handSwapchain),
+                 "create hand swapchain")) {
+        ctx->handSwapchain = XR_NULL_HANDLE;
+        return;
+    }
+    xrEnumerateSwapchainImages(ctx->handSwapchain, 0, &ctx->handImageCount, NULL);
+    ctx->handImages = calloc(ctx->handImageCount, sizeof(XrSwapchainImageOpenGLESKHR));
+    for (uint32_t i = 0; i < ctx->handImageCount; i++) {
+        ctx->handImages[i].type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR;
+    }
+    xrEnumerateSwapchainImages(ctx->handSwapchain, ctx->handImageCount, &ctx->handImageCount,
+                               (XrSwapchainImageBaseHeader*)ctx->handImages);
+
+    GLuint vs = compileShader(GL_VERTEX_SHADER, HAND_VERTEX_SRC);
+    GLuint fs = compileShader(GL_FRAGMENT_SHADER, HAND_FRAGMENT_SRC);
+    if (vs == 0 || fs == 0) {
+        return;
+    }
+    ctx->handProgram = glCreateProgram();
+    glAttachShader(ctx->handProgram, vs);
+    glAttachShader(ctx->handProgram, fs);
+    glBindAttribLocation(ctx->handProgram, 0, "a_joint");
+    glLinkProgram(ctx->handProgram);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    GLint ok = 0;
+    glGetProgramiv(ctx->handProgram, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetProgramInfoLog(ctx->handProgram, sizeof(log), NULL, log);
+        LOGE("hand program link failed: %s", log);
+        glDeleteProgram(ctx->handProgram);
+        ctx->handProgram = 0;
+        return;
+    }
+    ctx->handMvpUniform = glGetUniformLocation(ctx->handProgram, "u_mvp");
+    ctx->handPointScaleUniform = glGetUniformLocation(ctx->handProgram, "u_pointScale");
+    glGenFramebuffers(1, &ctx->handFbo);
+
+    // Fixed foveation, level high, no dynamic changes, no vertical offset.
+    // Honest note: with every other layer composed by the compositor this
+    // only thins the fragment work of the hand dots themselves.
+    if (ctx->fbFoveation) {
+        if (XR_FAILED(xrGetInstanceProcAddr(ctx->instance, "xrCreateFoveationProfileFB",
+                        (PFN_xrVoidFunction*)&ctx->pfnCreateFoveationProfile))
+                || XR_FAILED(xrGetInstanceProcAddr(ctx->instance, "xrDestroyFoveationProfileFB",
+                        (PFN_xrVoidFunction*)&ctx->pfnDestroyFoveationProfile))
+                || XR_FAILED(xrGetInstanceProcAddr(ctx->instance, "xrUpdateSwapchainFB",
+                        (PFN_xrVoidFunction*)&ctx->pfnUpdateSwapchain))
+                || ctx->pfnCreateFoveationProfile == NULL
+                || ctx->pfnUpdateSwapchain == NULL) {
+            LOGW("foveation entry points missing, hand layer stays unfoveated");
+        }
+        else {
+            XrFoveationLevelProfileCreateInfoFB level = {
+                XR_TYPE_FOVEATION_LEVEL_PROFILE_CREATE_INFO_FB
+            };
+            level.level = XR_FOVEATION_LEVEL_HIGH_FB;
+            level.verticalOffset = 0.0f;
+            level.dynamic = XR_FOVEATION_DYNAMIC_DISABLED_FB;
+
+            XrFoveationProfileCreateInfoFB profileInfo = {
+                XR_TYPE_FOVEATION_PROFILE_CREATE_INFO_FB
+            };
+            profileInfo.next = &level;
+            XrResult res = ctx->pfnCreateFoveationProfile(ctx->session, &profileInfo,
+                                                          &ctx->foveationProfile);
+            if (XR_SUCCEEDED(res)) {
+                XrSwapchainStateFoveationFB state = { XR_TYPE_SWAPCHAIN_STATE_FOVEATION_FB };
+                state.profile = ctx->foveationProfile;
+                res = ctx->pfnUpdateSwapchain(ctx->handSwapchain,
+                                              (XrSwapchainStateBaseHeaderFB*)&state);
+                LOGI("hand layer foveation apply: XrResult %d", res);
+            }
+            else {
+                LOGW("foveation profile create failed: XrResult %d", res);
+                ctx->foveationProfile = XR_NULL_HANDLE;
+            }
+        }
+    }
+
+    ctx->handLayerState = 1;
+    LOGI("hand presence layer ready, %dx%d per eye, foveation %s",
+         ctx->handEyeW, ctx->handEyeH,
+         (ctx->fbFoveation && ctx->foveationProfile != XR_NULL_HANDLE) ? "on" : "off");
+}
+
+// Draws the stashed joints and fills in the projection layer. Returns 1 when
+// the layer should go into this frame's layer list.
+static int renderHandLayer(XrCtx* ctx, XrSpace space,
+                           XrCompositionLayerProjection* layer,
+                           XrCompositionLayerProjectionView* projViews) {
+    // No tracked hands, no work at all: controllers keep this path free
+    if (ctx->handJointMask[HAND_LEFT] == 0 && ctx->handJointMask[HAND_RIGHT] == 0) {
+        return 0;
+    }
+    ensureHandLayer(ctx);
+    if (ctx->handLayerState != 1) {
+        return 0;
+    }
+    // The joints were located in the input pass's base space. Drawing them
+    // against any other space would put the hands somewhere else entirely.
+    if (ctx->handJointSpace != space) {
+        return 0;
+    }
+
+    XrViewLocateInfo locate = { XR_TYPE_VIEW_LOCATE_INFO };
+    locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    locate.displayTime = ctx->predictedDisplayTime;
+    locate.space = space;
+    XrViewState viewState = { XR_TYPE_VIEW_STATE };
+    XrView views[2] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+    uint32_t viewCount = 0;
+    if (XR_FAILED(xrLocateViews(ctx->session, &locate, &viewState, 2, &viewCount, views))
+            || viewCount < 2
+            || !(viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)
+            || !(viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT)) {
+        return 0;
+    }
+
+    // One batched buffer for both hands: centre in xyz, radius in w
+    float verts[HAND_COUNT * XR_HAND_JOINT_COUNT_EXT * 4];
+    int count = 0;
+    for (int h = 0; h < HAND_COUNT; h++) {
+        for (uint32_t j = 0; j < XR_HAND_JOINT_COUNT_EXT; j++) {
+            if (!(ctx->handJointMask[h] & (1u << j))) {
+                continue;
+            }
+            verts[count * 4 + 0] = ctx->handJointPos[h][j].x;
+            verts[count * 4 + 1] = ctx->handJointPos[h][j].y;
+            verts[count * 4 + 2] = ctx->handJointPos[h][j].z;
+            float r = ctx->handJointRadius[h][j];
+            if (r < 0.005f) r = 0.005f;
+            if (r > 0.030f) r = 0.030f;
+            verts[count * 4 + 3] = r;
+            count++;
+        }
+    }
+    if (count == 0) {
+        return 0;
+    }
+
+    uint32_t imageIndex = 0;
+    XrSwapchainImageAcquireInfo acquire = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+    if (XR_FAILED(xrAcquireSwapchainImage(ctx->handSwapchain, &acquire, &imageIndex))) {
+        return 0;
+    }
+    XrSwapchainImageWaitInfo wait = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+    wait.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(ctx->handSwapchain, &wait);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, ctx->handFbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                           ctx->handImages[imageIndex].image, 0);
+    glViewport(0, 0, ctx->handEyeW * 2, ctx->handEyeH);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glUseProgram(ctx->handProgram);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, verts);
+    glEnableVertexAttribArray(0);
+    // The video passes leave attribute 1 enabled with their own pointer, and
+    // a draw of 52 points would read far past that little quad array
+    glDisableVertexAttribArray(1);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
+    for (int eye = 0; eye < 2; eye++) {
+        float proj[16], view[16], mvp[16];
+        handProjMatrix(views[eye].fov, proj);
+        handViewMatrix(&views[eye].pose, view);
+        handMatMul(proj, view, mvp);
+        glViewport(eye * ctx->handEyeW, 0, ctx->handEyeW, ctx->handEyeH);
+        glUniformMatrix4fv(ctx->handMvpUniform, 1, GL_FALSE, mvp);
+        // proj[5] is 2 over the tangent height, so this is pixels per metre
+        // at unit clip depth
+        glUniform1f(ctx->handPointScaleUniform, proj[5] * (float)ctx->handEyeH * 0.5f);
+        glDrawArrays(GL_POINTS, 0, count);
+    }
+
+    glDisable(GL_BLEND);
+    glDisableVertexAttribArray(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    XrSwapchainImageReleaseInfo release = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+    xrReleaseSwapchainImage(ctx->handSwapchain, &release);
+
+    for (int eye = 0; eye < 2; eye++) {
+        memset(&projViews[eye], 0, sizeof(projViews[eye]));
+        projViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+        projViews[eye].pose = views[eye].pose;
+        projViews[eye].fov = views[eye].fov;
+        projViews[eye].subImage.swapchain = ctx->handSwapchain;
+        projViews[eye].subImage.imageRect.offset.x = eye * ctx->handEyeW;
+        projViews[eye].subImage.imageRect.offset.y = 0;
+        projViews[eye].subImage.imageRect.extent.width = ctx->handEyeW;
+        projViews[eye].subImage.imageRect.extent.height = ctx->handEyeH;
+        projViews[eye].subImage.imageArrayIndex = 0;
+    }
+    memset(layer, 0, sizeof(*layer));
+    layer->type = XR_TYPE_COMPOSITION_LAYER_PROJECTION;
+    layer->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    layer->space = space;
+    layer->viewCount = 2;
+    layer->views = projViews;
+    return 1;
+}
+
 JNIEXPORT void JNICALL
 Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject thiz, jlong handle,
                                                            jboolean newFrame, jfloatArray texMatrixArr,
@@ -4552,8 +5065,11 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
     XrCompositionLayerQuad dotLayer;
     XrCompositionLayerQuad handleLayer;
     XrCompositionLayerQuad envButtonLayer;
+    XrCompositionLayerQuad exitButtonLayer;
     XrCompositionLayerQuad pickerLayer;
     XrCompositionLayerQuad outlineLayers[2];
+    XrCompositionLayerProjection handLayer;
+    XrCompositionLayerProjectionView handLayerViews[2];
     const XrCompositionLayerBaseHeader* layers[16];
     uint32_t layerCount = 0;
 
@@ -4679,9 +5195,10 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
             layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&overlayLayer;
         }
 
-        // The bar and the environment button share a hover area, so reaching
-        // for one keeps the other on screen rather than swapping them
-        int barArea = ctx->hoverKind == HOVER_BAR || ctx->hoverKind == HOVER_ENVBUTTON;
+        // The bar and the two buttons beside it share a hover area, so
+        // reaching for one keeps the others on screen rather than swapping
+        int barArea = ctx->hoverKind == HOVER_BAR || ctx->hoverKind == HOVER_ENVBUTTON
+                || ctx->hoverKind == HOVER_EXITBUTTON;
 
         // Move bar and resize corner, shown only while the ray is over them.
         // Both live in the screen's own frame, so they travel with it.
@@ -4767,6 +5284,35 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
             layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&envButtonLayer;
         }
 
+        // The exit button, right of the move bar. The way out of the stream
+        // for a user with tracked hands and no controllers.
+        if (ctx->exitButtonReady && (barArea || ctx->pickerOpen)) {
+            Vec3 local;
+            float side;
+            exitButtonPlacement(ctx, screenHeight, &local, &side);
+            Vec3 offset = quatRotate(screenPose.orientation, local);
+
+            memset(&exitButtonLayer, 0, sizeof(exitButtonLayer));
+            exitButtonLayer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+            exitButtonLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            exitButtonLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            exitButtonLayer.subImage.swapchain = ctx->exitButtonSwapchain;
+            exitButtonLayer.subImage.imageRect.offset.x = 0;
+            exitButtonLayer.subImage.imageRect.offset.y = 0;
+            exitButtonLayer.subImage.imageRect.extent.width = OUTLINE_TEX;
+            exitButtonLayer.subImage.imageRect.extent.height = OUTLINE_TEX;
+            exitButtonLayer.subImage.imageArrayIndex = 0;
+            exitButtonLayer.space = space;
+            exitButtonLayer.pose.orientation = screenPose.orientation;
+            exitButtonLayer.pose.position.x = screenPose.position.x + offset.x;
+            exitButtonLayer.pose.position.y = screenPose.position.y + offset.y;
+            exitButtonLayer.pose.position.z = screenPose.position.z + offset.z;
+            float exitScale = ctx->exitButtonHot ? 1.18f : 1.0f;
+            exitButtonLayer.size.width = side * exitScale;
+            exitButtonLayer.size.height = side * exitScale;
+            layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&exitButtonLayer;
+        }
+
         // The environment grid, floating in front of the screen, with the
         // hovered and the chosen cell ringed
         if (ctx->pickerOpen && ctx->pickerReady) {
@@ -4831,6 +5377,12 @@ Java_com_limelight_binding_video_XrRenderer_nativeEndFrame(JNIEnv* env, jobject 
                     layers[layerCount++] = (const XrCompositionLayerBaseHeader*)mark;
                 }
             }
+        }
+
+        // Hand presence, above the screen and the furniture, below the laser
+        // so the pointer still reads over the hand that casts it
+        if (renderHandLayer(ctx, space, &handLayer, handLayerViews)) {
+            layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&handLayer;
         }
 
         // Laser and cursor, submitted last so they sit over the picture. Two

@@ -297,12 +297,22 @@
             android:name=".hydra.HydraLaunchActivity"
             android:exported="true"
             android:resizeableActivity="true"
+            android:screenOrientation="landscape"
             android:label="Hydra Kiosk"
-            android:configChanges="mcc|mnc|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection">
+            android:configChanges="mcc|mnc|density|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Horizon OS panel size. Without this an unconfigured 2D
+                 activity gets the phone default of 360x640dp, which is the
+                 small portrait panel seen in vrshell. 1024x640dp is Meta's
+                 documented default panel. The layout element is flagged by
+                 desktop lint but honoured by Horizon OS -->
+            <layout
+                android:defaultWidth="1024dp"
+                android:defaultHeight="640dp" />
+            <meta-data android:name="com.oculus.vrshell.supports_free_resizing" android:value="true" />
             <meta-data android:name="pvr.app.type" android:value="2d" />
         </activity>
 
@@ -312,9 +322,15 @@
             android:name=".hydra.HydraCatalogActivity"
             android:exported="false"
             android:resizeableActivity="true"
+            android:screenOrientation="landscape"
             android:label="Hydra Catalog"
             android:launchMode="singleTask"
-            android:configChanges="mcc|mnc|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection">
+            android:configChanges="mcc|mnc|density|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection">
+            <!-- Landscape Horizon OS panel, see HydraLaunchActivity -->
+            <layout
+                android:defaultWidth="1024dp"
+                android:defaultHeight="640dp" />
+            <meta-data android:name="com.oculus.vrshell.supports_free_resizing" android:value="true" />
             <meta-data android:name="pvr.app.type" android:value="2d" />
         </activity>
 
@@ -324,8 +340,14 @@
             android:name=".hydra.HydraEnrollmentActivity"
             android:exported="true"
             android:resizeableActivity="true"
+            android:screenOrientation="landscape"
             android:label="Hydra Enrollment"
-            android:configChanges="mcc|mnc|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection">
+            android:configChanges="mcc|mnc|density|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection">
+            <!-- Landscape Horizon OS panel, see HydraLaunchActivity -->
+            <layout
+                android:defaultWidth="1024dp"
+                android:defaultHeight="640dp" />
+            <meta-data android:name="com.oculus.vrshell.supports_free_resizing" android:value="true" />
             <meta-data android:name="pvr.app.type" android:value="2d" />
         </activity>
 

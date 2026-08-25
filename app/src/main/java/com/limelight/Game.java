@@ -2763,6 +2763,20 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         conn.sendMouseHighResScroll((short)(clicks * 120));
     }
 
+    // The in-session exit button, the way out for a user with tracked hands
+    // and no controllers. Same path as a graceful termination: finish() runs
+    // the normal teardown and returns to the launcher activity.
+    @Override
+    public void onVrExit() {
+        LimeLog.info("VR exit button pressed, ending stream");
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                finish();
+            }
+        });
+    }
+
     @Override
     public void onPerfUpdate(final String text) {
         // In VR the activity window is not displayed, so the stats go to the

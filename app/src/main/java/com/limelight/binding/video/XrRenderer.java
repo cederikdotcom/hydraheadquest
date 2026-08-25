@@ -117,6 +117,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     private static final int IN_POSE_DIRTY = 6;
     private static final int IN_POSE = 8;
     private static final int IN_PICKER_PICK = 17;
+    private static final int IN_EXIT = 18;
     private static final int IN_SLOTS = 20;
     private static final int POSE_VALUES = 9;
     private final float[] inputState = new float[IN_SLOTS];
@@ -152,6 +153,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
     private static final int MAX_PHOTOS = PICKER_CELLS - CELL_FIRST_PHOTO;
     private final AtomicReference<ByteBuffer> pendingPickerArt = new AtomicReference<>();
     private final AtomicReference<ByteBuffer> pendingEnvButton = new AtomicReference<>();
+    private final AtomicReference<ByteBuffer> pendingExitButton = new AtomicReference<>();
     private String[] environmentFiles = new String[0];
     private volatile int environmentChoice = CELL_VOID;
     private volatile boolean passthroughOn;
@@ -170,6 +172,8 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         void onVrPointerMove(float u, float v);
         void onVrButton(int button, boolean down);
         void onVrScroll(int clicks);
+        // The in-session exit button was clicked. End the stream cleanly.
+        void onVrExit();
     }
 
     public void setInputListener(InputListener listener) {
@@ -197,7 +201,8 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
                                           float[] out);
     private native void nativeSetScreenPose(long ctx, float[] pose);
     private native void nativeUploadBackground(long ctx, ByteBuffer pixels, int width, int height);
-    private native void nativeUploadPicker(long ctx, ByteBuffer grid, ByteBuffer button);
+    private native void nativeUploadPicker(long ctx, ByteBuffer grid, ByteBuffer button,
+                                           ByteBuffer exit);
     private native void nativeSetEnvironment(long ctx, int choice, boolean backgroundOn);
     private native void nativeUploadOverlay(long ctx, ByteBuffer pixels, int width, int height);
     private native float nativeGetWarpGpuMs(long ctx);
@@ -474,8 +479,9 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
 
             ByteBuffer grid = pendingPickerArt.getAndSet(null);
             ByteBuffer button = pendingEnvButton.getAndSet(null);
-            if (grid != null || button != null) {
-                nativeUploadPicker(nativeCtx, grid, button);
+            ByteBuffer exitArt = pendingExitButton.getAndSet(null);
+            if (grid != null || button != null || exitArt != null) {
+                nativeUploadPicker(nativeCtx, grid, button, exitArt);
             }
 
             ByteBuffer background = pendingBackground.getAndSet(null);
@@ -716,6 +722,7 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         grid.recycle();
 
         pendingEnvButton.set(toBuffer(buildEnvButton()));
+        pendingExitButton.set(toBuffer(buildExitButton()));
     }
 
     // A framed landscape, which is about as much as reads at this size
@@ -742,6 +749,28 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         hills.lineTo(102.0f, 100.0f);
         hills.close();
         canvas.drawPath(hills, paint);
+
+        return button;
+    }
+
+    // A framed X. Clicking it ends the stream, so it reads as "close" and
+    // sits on the opposite end of the move bar from the environment button.
+    private Bitmap buildExitButton() {
+        Bitmap button = Bitmap.createBitmap(ENV_BUTTON_TEX, ENV_BUTTON_TEX,
+                                            Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(button);
+        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        canvas.drawColor(0, PorterDuff.Mode.CLEAR);
+
+        paint.setColor(0xEEFFFFFF);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(6.0f);
+        canvas.drawRoundRect(new RectF(14.0f, 14.0f, 114.0f, 114.0f), 22.0f, 22.0f, paint);
+
+        paint.setStrokeWidth(9.0f);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        canvas.drawLine(44.0f, 44.0f, 84.0f, 84.0f, paint);
+        canvas.drawLine(84.0f, 44.0f, 44.0f, 84.0f, paint);
 
         return button;
     }
@@ -842,6 +871,12 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         int pick = (int)inputState[IN_PICKER_PICK];
         if (pick >= 0) {
             chooseEnvironment(pick);
+        }
+
+        // Reported once, on the click edge, by the native side
+        if (inputState[IN_EXIT] != 0.0f && inputListener != null) {
+            LimeLog.info("XR exit button clicked, ending the stream");
+            inputListener.onVrExit();
         }
     }
 
