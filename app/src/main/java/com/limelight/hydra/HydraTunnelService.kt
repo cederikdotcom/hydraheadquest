@@ -75,7 +75,7 @@ class HydraTunnelService : Service() {
         return builder
             .setContentTitle("Hydra mesh tunnel active")
             .setContentText("Keeping the WireGuard tunnel alive")
-            .setSmallIcon(android.R.drawable.stat_sys_vpn_ic)
+            .setSmallIcon(android.R.drawable.ic_lock_lock)
             .setContentIntent(contentIntent)
             .setOngoing(true)
             .build()
