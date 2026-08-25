@@ -165,3 +165,25 @@ enroll, heartbeat, catalog, body selection, pairing, stream, stop, screenshot.
 - Stop any stream you started and confirm cosmic-pretzel-98 shows idle again.
 - If you streamed via PinchTab or the monitor, delete leftover streaming
   sessions.
+
+
+## WireGuard (Phase 2, v0.3.0+)
+
+Prerequisite: the head is enrolled and the admin config
+`GET /api/v1/heads/{id}/wireguard-config` returns 200 (provisioned at
+enrollment time by hydracluster through hydraguard).
+
+1. Open Operator (PIN 1337), select WireGuard.
+   - First run: the Android VPN consent dialog appears. Accept it.
+   - Expected: status dialog shows "up hs <n>s" within a few seconds.
+2. Check the heartbeat: `diagnostics.wireguard` in
+   `GET /api/v1/heads/{id}` shows "up hs <n>s" and stays fresh.
+   - "up no-handshake" means UDP 51820 to hydraguard.experiencenet.com
+     is blocked, or Horizon OS interferes with VpnService.
+   - "consent-needed" means the dialog was denied; run the operator
+     action again.
+3. Restart the app. Expected: the tunnel reconnects silently (no
+   dialog) and the heartbeat shows "up hs" again.
+4. Off-venue stream test: with the tunnel up, start an experience.
+   Expected: LAN probe fails, mesh probe to the body wireguard_ip
+   succeeds, pairing and stream proceed over 10.10.0.0/16.
