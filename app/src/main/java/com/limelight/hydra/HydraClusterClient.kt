@@ -6,6 +6,7 @@ import com.limelight.hydra.model.Experience
 import com.limelight.hydra.model.HeadCommand
 import com.limelight.hydra.model.HeadConfig
 import com.limelight.hydra.model.HeadDiagnostics
+import com.limelight.hydra.model.XrSessionState
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.IOException
@@ -26,6 +27,15 @@ import java.nio.charset.StandardCharsets
  */
 class HydraClusterClient(private val config: EnrollmentConfig) {
 
+    /**
+     * IOException carrying the HTTP status code of a non-2xx response,
+     * so callers can branch on specific codes (404 = no XR session, 409
+     * = body busy) without parsing the message. Every non-2xx thrown by
+     * this client is of this type; plain IOExceptions remain transport
+     * failures.
+     */
+    class HttpStatusException(val code: Int, message: String) : IOException(message)
+
     companion object {
         /** Request timeout for API calls, in milliseconds. */
         const val REQUEST_TIMEOUT_MS = 15000
@@ -42,7 +52,16 @@ class HydraClusterClient(private val config: EnrollmentConfig) {
         @Throws(IOException::class)
         fun enroll(serverUrl: String, enrollmentToken: String, name: String): EnrollmentConfig {
             val base = serverUrl.trimEnd('/')
-            val body = JSONObject().put("name", name).toString()
+            // "type" makes the cluster enroll this head with the
+            // hydraheadquest role. Every XR gate (XR tiles in the catalog,
+            // the xr-session endpoints, XR assignments) checks that role.
+            // An old cluster ignores the unknown field and enrolls the
+            // head with today's iPad behavior, which keeps the flat path
+            // working there.
+            val body = JSONObject()
+                .put("name", name)
+                .put("type", "hydraheadquest")
+                .toString()
             val response = rawRequest(
                 url = "$base/api/v1/heads",
                 method = "POST",
@@ -91,7 +110,7 @@ class HydraClusterClient(private val config: EnrollmentConfig) {
                 val bytes = stream?.use { readAll(it) } ?: ByteArray(0)
                 if (code !in 200..299) {
                     val text = String(bytes, StandardCharsets.UTF_8).take(512)
-                    throw IOException("HTTP $code from $method $url: $text")
+                    throw HttpStatusException(code, "HTTP $code from $method $url: $text")
                 }
                 return bytes
             } finally {
@@ -147,19 +166,31 @@ class HydraClusterClient(private val config: EnrollmentConfig) {
         return Experience.listFromJson(String(response, StandardCharsets.UTF_8))
     }
 
-    /** GET /api/v1/bodies/eligible?district=&venue=&head_id=&experience= */
+    /**
+     * GET /api/v1/bodies/eligible?district=&venue=&head_id=&experience=
+     *
+     * Pass streamMode "xr" for XR body discovery: a new cluster filters
+     * to XR-capable idle bodies and adds xr_drivers / xr_state to each
+     * entry; an old cluster ignores the parameter, which is why callers
+     * must re-filter on xr_drivers client-side. Null keeps today's flat
+     * query byte-identical.
+     */
     @Throws(IOException::class)
     fun getEligibleBodies(
         district: String?,
         venue: String?,
         headId: String,
-        experience: String
+        experience: String,
+        streamMode: String? = null
     ): List<EligibleBody> {
         val query = StringBuilder("/api/v1/bodies/eligible?")
         query.append("district=").append(encode(district ?: ""))
         query.append("&venue=").append(encode(venue ?: ""))
         query.append("&head_id=").append(encode(headId))
         query.append("&experience=").append(encode(experience))
+        if (streamMode != null) {
+            query.append("&stream_mode=").append(encode(streamMode))
+        }
         val response = request("GET", query.toString(), null, null, REQUEST_TIMEOUT_MS)
         return EligibleBody.listFromJson(String(response, StandardCharsets.UTF_8))
     }
@@ -223,6 +254,71 @@ class HydraClusterClient(private val config: EnrollmentConfig) {
             body.toByteArray(StandardCharsets.UTF_8),
             "application/json", REQUEST_TIMEOUT_MS
         )
+    }
+
+    // ------------------------------------------------------------------
+    // XR session (immersive ALVR path, issue #558)
+    // ------------------------------------------------------------------
+
+    /**
+     * POST /api/v1/heads/{head_id}/xr-session
+     *
+     * Ask the cluster to arm the given body for this head. Returns the
+     * created session (state "requested") on 201. Failure surfaces as
+     * [HttpStatusException]: 409 body_busy / not_xr_capable, and 404 on
+     * a cluster without XR support.
+     */
+    @Throws(IOException::class)
+    fun postXrSession(
+        bodyId: String,
+        experience: String,
+        clientHostname: String,
+        clientIp: String?
+    ): XrSessionState {
+        val body = JSONObject()
+        body.put("body_id", bodyId)
+        body.put("experience", experience)
+        body.put("client_hostname", clientHostname)
+        body.put("client_ip", clientIp ?: JSONObject.NULL)
+        val response = request(
+            "POST", "$headPath/xr-session",
+            body.toString().toByteArray(StandardCharsets.UTF_8),
+            "application/json", REQUEST_TIMEOUT_MS
+        )
+        return XrSessionState.fromJson(String(response, StandardCharsets.UTF_8))
+    }
+
+    /**
+     * GET /api/v1/heads/{head_id}/xr-session
+     *
+     * The current XR session of this head, or null when the head has no
+     * session (404). Polled every 5 s while arming or in an XR session;
+     * null IS the end signal there.
+     */
+    @Throws(IOException::class)
+    fun getXrSession(): XrSessionState? {
+        return try {
+            val response = request("GET", "$headPath/xr-session", null, null, REQUEST_TIMEOUT_MS)
+            XrSessionState.fromJson(String(response, StandardCharsets.UTF_8))
+        } catch (e: HttpStatusException) {
+            if (e.code == 404) null else throw e
+        }
+    }
+
+    /**
+     * DELETE /api/v1/heads/{head_id}/xr-session
+     *
+     * End this head's XR session: the cluster marks it "ending" and the
+     * body tears the chain down. Idempotent; a 404 (already gone) is
+     * treated as success.
+     */
+    @Throws(IOException::class)
+    fun deleteXrSession() {
+        try {
+            request("DELETE", "$headPath/xr-session", null, null, REQUEST_TIMEOUT_MS)
+        } catch (e: HttpStatusException) {
+            if (e.code != 404) throw e
+        }
     }
 
     @Throws(IOException::class)

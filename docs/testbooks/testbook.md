@@ -210,3 +210,57 @@ Operator 5-step run (Operator, PIN 1337, Diagnostics):
    first, then mesh). Step 5 shows the mesh probe plus the local
    tunnel state.
 3. Report issue after a run includes the step results in the report.
+
+## XR immersive path (issue #558)
+
+Run after any change to the XR flow, and always together with the flat
+smoke test: the top acceptance criterion is that flat streaming stays
+untouched.
+
+### Prerequisites
+
+- ALVR client APK installed on the headset; head enrolled; tunnel up.
+- The head node has the `hydraheadquest` role (automatic on new
+  enrollments; heads enrolled by an older app version need an admin
+  role change or a re-enroll, see the runbook).
+- Head's `xr_client_hostname` set in hydracluster.
+- An XR-capable body (role `alvr`, ALVR staged) idle in the head's
+  district. First hardware: chunky-turnip-23 in a parked district.
+- One library experience marked `"stream_mode": "xr"`.
+- Never run this against bxl1 production bodies.
+
+### Steps
+
+1. Catalog: the XR experience tile shows an XR tag. Flat tiles are
+   unchanged.
+2. Tap the XR tile. Expected: "Preparing headset stream... (this takes
+   about a minute)". Heartbeat `status` goes to `pairing` and
+   `diagnostics.xr_client` shows `alvr`.
+3. Within about 110 s the ALVR client launches by itself and the
+   experience renders immersively. Heartbeat `status` is `streaming-xr`
+   with the body id set.
+4. Doff the headset for under 90 s, put it back on. Expected: the
+   session resumes; the head still shows `streaming-xr`.
+5. Reopen the kiosk (leave the ALVR client). Expected: "Return to
+   experience" and "End session". Tap Return: the ALVR client comes
+   back to the foreground.
+6. Reopen the kiosk and tap End session. Expected: the grid returns
+   within about 10 s and the head heartbeat goes back to
+   `self-service`. No relaunch happens on the following ticks (the
+   stale-block guard).
+7. On the body: driver unregistered, Sunshine back up (hydrabody
+   testbook has the exact checks).
+8. Immediately start a FLAT stream on the same body. Expected: pairing
+   and stream work first try. This proves the switch.
+9. Negative test: uninstall or rename the ALVR client, tap the XR tile.
+   Expected: "ALVR client not installed", no session request on the
+   cluster, flat tiles still work.
+10. Re-run the flat Phase 1 smoke test on cosmic-pretzel-98. Expected:
+    byte-identical behavior to before the XR build.
+
+### Pass criteria
+
+- XR session arms and streams within 180 s.
+- Doff under 90 s resumes; End session tears down and frees the body.
+- The same body serves a flat stream immediately after an XR session.
+- Flat streaming behavior is unchanged everywhere.

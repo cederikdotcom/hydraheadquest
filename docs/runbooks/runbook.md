@@ -193,3 +193,57 @@ The app enrolls as `quest-head-<first 6 chars of the device id>`. The name is
 unique per headset from the first build. Never use a shared literal name such
 as `ipad-head`; that collision broke HydraGuard peer allocation once
 (hydracluster #449) and we do not repeat it.
+
+## XR immersive path (issue #558)
+
+The head can run immersive experiences through ALVR instead of Moonlight.
+The wire contract is section 14 of `docs/hydra-api-contract.md`. The body
+side (ALVR role, driver switching, teardown) is documented in the hydrabody
+runbook; the cluster protocol in the hydracluster docs.
+
+### Prerequisites
+
+- The separate ALVR client APK (`alvr.client.stable`) is installed on the
+  headset. It is its own app, deployed via HMS or sideload; it is never
+  merged into this APK.
+- The head node carries the `hydraheadquest` role in hydracluster. New
+  enrollments with this app version set it automatically; a head enrolled
+  by an older version has the iPad role and an admin must change it to
+  `hydraheadquest` (or re-enroll the head) before any XR gate opens.
+- An admin set the head's `xr_client_hostname` in hydracluster (for our
+  first Quest: `0529.client`, the hostname the ALVR client reports).
+- The head has its WireGuard tunnel up. The mesh address is sent as
+  `client_ip` so the body can trust the client.
+- At least one body in the district has the `alvr` role and ALVR staged
+  (see the hydrabody runbook; chunky-turnip-23 is the staging body).
+- One or more library experiences carry `"stream_mode": "xr"`.
+
+### How it runs
+
+1. XR experiences show an XR tag on their catalog tile.
+2. A tap checks the ALVR client is installed, discovers an XR-capable body
+   (`stream_mode=xr` eligible query), and POSTs the XR session.
+3. The head shows "Preparing headset stream..." while the body arms the
+   ALVR chain. This takes 45 to 90 s, worst about 110 s. The head gives up
+   at 180 s.
+4. When the session is armed the head launches the ALVR client. The
+   experience appears in the headset; the body starts it when the client
+   connects.
+5. The kiosk keeps running behind the ALVR client and keeps heartbeating
+   (HydraTunnelService pins the process and the tunnel).
+6. Reopening the kiosk during a session shows "Return to experience" and
+   "End session". End marks the session ending; the body tears down. The
+   head never kills the session locally: taking the headset off starts a
+   90 s doff grace on the body, and putting it back on resumes.
+
+### Failure surface
+
+- "ALVR client not installed": install the client APK.
+- "No ALVR client hostname is configured for this head": set
+  `xr_client_hostname` on the head in hydracluster.
+- "No XR bodies available": no idle body advertises the alvr driver, or
+  the cluster is old. Check the body role and hydrabody version.
+- "Cluster does not support XR heads": the cluster predates the XR
+  endpoints. Deploy the new hydracluster first.
+- "Headset session failed: arm_timeout" or "connect_timeout": body-side
+  chain problem. Debug on the body (hydrabody runbook), not on the head.

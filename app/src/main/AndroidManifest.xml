@@ -68,6 +68,13 @@
         android:name="android.hardware.type.pc"
         android:required="false"/>
 
+    <!-- Package visibility for the separate ALVR client APK (issue #558).
+         Android 11+ filters getPackageInfo without this; the XR pre-flight
+         check needs it before launching the client by explicit intent -->
+    <queries>
+        <package android:name="alvr.client.stable" />
+    </queries>
+
     <!-- VR headsets. Optional so phones and TVs are unaffected -->
     <uses-feature
         android:name="android.hardware.vr.headtracking"

@@ -43,12 +43,20 @@ Called once on first launch after the QR scan.
 - Request body:
 
 ```json
-{ "name": "quest-head-<6 chars of device id>" }
+{ "name": "quest-head-<6 chars of device id>", "type": "hydraheadquest" }
 ```
 
 The iPad app sends `"ipad-head"` for all devices. That caused a HydraGuard name
 collision (hydracluster #449). Quest must send a unique name from the first build:
 `quest-head-` plus the first 6 characters of a stable device id.
+
+`type` makes a new cluster enroll the head with the `hydraheadquest` role.
+Every XR gate checks that role: XR tiles in the catalog, the xr-session
+endpoints, and XR assignments. An old cluster ignores the field and enrolls
+the head with the iPad defaults; the flat path works there, XR does not.
+A head enrolled before this field existed carries the iPad role: an admin
+must set its role to `hydraheadquest` in hydracluster (or re-enroll it)
+before the XR path can work on it.
 
 - Response body:
 
@@ -82,7 +90,8 @@ Fetched on every tick (see timing). Response:
     "stream_mode": "streaming"
   },
   "sunshine_username": "sunshine",
-  "sunshine_password": "..."
+  "sunshine_password": "...",
+  "xr_client_hostname": "0529.client"
 }
 ```
 
@@ -96,8 +105,16 @@ a stream to this head.
   the scheme prefix (everything through `://`) from `stream_url`.
 - An active assignment tells the head to start that experience. See the state
   machine, section 10.
+- `stream_mode`: optional. The value `xr` routes the assignment through the XR
+  session flow (section 14) instead of Moonlight pairing. Absent or any other
+  value means the flat Moonlight path.
 - Default Sunshine credentials when the config omits them: username `sunshine`,
   password `sunshine`.
+
+`xr_client_hostname`: the ALVR client hostname of this head (for example
+`0529.client`), set once by an admin. The head echoes it as `client_hostname`
+in the XR session request (section 14). Absent on flat heads. Without it the
+head refuses to start an XR experience.
 
 ## 4. Heartbeat
 
@@ -127,8 +144,11 @@ a stream to this head.
 
 Field rules:
 
-- `status`: one of `idle`, `self-service`, `starting`, `streaming`, `error`.
-  The state machine maps to these values (section 10).
+- `status`: one of `idle`, `self-service`, `starting`, `pairing`, `streaming`,
+  `streaming-xr`, `error`. The state machine maps to these values (section 10).
+  `streaming-xr` is the XR session state; `pairing` is reported while an XR
+  body is arming. The cluster stores status strings verbatim, so both values
+  are additive.
 - `body_id`: the id of the body currently streamed from. Null when not streaming.
 - `version`: app version prefixed with `v`.
 - `wireguard`: tunnel state string from the WireGuard manager
@@ -141,6 +161,9 @@ Field rules:
 - `wifi_ssid`: current Wi-Fi SSID.
 - `local_ip`: the device's local IP address.
 - `moonlight_client_id`: the Moonlight unique client id. May be null.
+- `xr_client`: optional. The literal string `alvr` while an XR session is
+  arming or running. Omitted otherwise. The operator diagnostics view shows
+  the same value.
 
 No response body is consumed. Only the status code matters.
 
@@ -167,6 +190,10 @@ Fetched on every tick, in the background. Response is a JSON array:
   portrait streams 1080x1920, everything else streams 1920x1080.
 - `enable_microphone`: optional boolean. When true, start the mic relay after
   the stream starts (section 9).
+- `stream_mode`: optional. The value `xr` marks an immersive experience: the
+  tile shows an XR tag and a tap starts the XR session flow (section 14), not
+  Moonlight. Absent or any other value means the flat path. The cluster only
+  serves `xr` entries to heads of type `hydraheadquest`.
 
 ## 6. Body discovery and selection
 
@@ -179,6 +206,13 @@ Query parameters, all required:
 - `head_id`: this head's id
 - `experience`: the experience `name`
 
+Optional:
+
+- `stream_mode=xr`: XR body discovery (section 14). A new cluster filters to
+  XR-capable idle bodies and adds `xr_drivers` and `xr_state` to each entry.
+  An old cluster ignores the parameter, so the head must re-filter
+  client-side on `xr_drivers` containing `alvr`.
+
 Response is a JSON array of bodies:
 
 ```json
@@ -189,12 +223,17 @@ Response is a JSON array of bodies:
     "ip": "192.168.1.20",
     "wireguard_ip": "10.10.0.7",
     "same_venue": true,
-    "stream_count": 0
+    "stream_count": 0,
+    "xr_drivers": ["alvr"],
+    "xr_state": "idle"
   }
 ]
 ```
 
 All fields are optional in the decoder. Treat a missing `stream_count` as 0.
+`xr_drivers` and `xr_state` appear only on XR queries against a new cluster;
+a body engaged in an XR session reports `stream_count` 1, which keeps flat
+heads off it.
 
 ### Selection rule
 
@@ -339,6 +378,8 @@ States, ported from `AppState.swift` `HeadState`:
 | `discovering` | experience name | `starting` |
 | `pairing` | body name, host, experience name | `starting` |
 | `streaming` | host, experience name, body id, server cert | `streaming` |
+| `armingXr` | body name, host, experience, body id | `pairing` |
+| `streamingXr` | host, experience, body id, self-service flag | `streaming-xr` |
 | `error` | message | `error` |
 
 Transitions:
@@ -370,6 +411,27 @@ Transitions:
 - Tick in `error` or `unconfigured`: do nothing.
 - Tick in `idle` / `selfService` with no active assignment: stay in
   `selfService(experiences)` with the latest catalog.
+
+XR transitions (issue #558; the flat transitions above are untouched):
+
+- `selfService` / `idle` -> `discovering(experience)`: user taps an XR tile,
+  or the tick finds an active assignment with `stream_mode` == `xr`. The
+  pre-flight (ALVR client installed, `xr_client_hostname` configured) runs
+  first; failure goes straight to `error`.
+- `discovering` -> `armingXr(bodyName, host, experience, bodyId)`: XR body
+  selected and `POST xr-session` accepted, or an existing live session for
+  the same experience adopted (the app-restart-mid-session path). Heartbeat
+  drops to 5 s.
+- `armingXr` -> `streamingXr(...)`: the polled session reports `armed` (or
+  `active`) and the ALVR client launch succeeded.
+- `armingXr` -> `error(msg)`: session `failed`, gone (404), `ending`, launch
+  failure, or 180 s elapsed. Best-effort `DELETE xr-session` first.
+- `streamingXr` -> `selfService(experiences)`: the polled session is gone
+  (404), `ending`, or `failed`. Same cleanup as a flat stream end: mark the
+  ended session, send the stream DELETE (section 8), heartbeat back to 30 s.
+- In `streamingXr`, catalog resume shows "Return to experience" (relaunch
+  the ALVR client intent) and "End session" (`DELETE xr-session`). The end
+  never kills anything locally; the body may be inside its doff grace.
 
 Tick behavior common to all states: fetch head config (fall back to the cached
 copy on failure), refresh the catalog in the background, then send the heartbeat.
@@ -422,6 +484,105 @@ routing). The endpoint contract is listed here for the VpnService phase.
 | Reachability probe per host | 1 s |
 | PIN POST delay after pairing callback | 0.3 s |
 | PIN POST timeout | 20 s |
+| XR session poll (armingXr and streamingXr) | 5 s |
+| XR arming timeout, head-side | 180 s |
+
+## 14. XR session (immersive ALVR path, issue #558)
+
+Immersive experiences (`stream_mode` == `xr`) never use Sunshine pairing or
+Moonlight. The head asks the cluster to arm a body with ALVR, launches the
+separate ALVR client APK when the body is armed, and the body runs the
+experience natively into the headset. The body is the source of truth for the
+session end; the head has no client-side process detection.
+
+### Prerequisites on the head
+
+- The ALVR client APK (`alvr.client.stable`) is installed. The head checks
+  with `PackageManager.getPackageInfo` before any session request (a
+  `<queries>` entry in the manifest makes the package visible).
+- Head config carries `xr_client_hostname` (section 3).
+- `client_ip` is the head's own WireGuard Interface address (for example
+  `10.10.200.7`), read from the stored tunnel config; the local IP is the
+  fallback when no tunnel is configured.
+
+### POST /api/v1/heads/{head_id}/xr-session
+
+- `Content-Type: application/json`
+- Request body:
+
+```json
+{
+  "body_id": "node-abc",
+  "experience": "experience-name",
+  "client_hostname": "0529.client",
+  "client_ip": "10.10.200.7"
+}
+```
+
+- 201 with the GET shape below on success (state `requested`).
+- 409 `{"error":"body_busy"}` when the body is streaming, engaged, or already
+  has an XR session.
+- 409 `{"error":"head_busy"}` when this head already owns an XR session.
+  The head avoids this by a GET pre-check before every POST: a live session
+  for the same experience is adopted (re-enter `armingXr`; this is the
+  app-restart-mid-session path), anything else is DELETEd first.
+- 409 `{"error":"not_xr_capable"}` when the body does not advertise the
+  driver.
+- 404 on a cluster without XR support: show "Cluster does not support XR
+  heads".
+
+### GET /api/v1/heads/{head_id}/xr-session
+
+Polled every 5 s while in `armingXr` or `streamingXr`. Response:
+
+```json
+{
+  "session_id": "uuid",
+  "state": "armed",
+  "body_id": "node-abc",
+  "experience": "experience-name",
+  "body_host": "10.10.100.12",
+  "reason": ""
+}
+```
+
+- `state`: `requested`, `arming`, `armed`, `active`, `draining`, `ending`,
+  or `failed`. `reason` is set when `failed` (for example `arm_timeout`,
+  `connect_timeout`).
+- 404 when the head has no session. While streaming, 404 IS the end signal.
+
+### DELETE /api/v1/heads/{head_id}/xr-session
+
+Ends the session: the cluster marks it `ending` and the body tears the ALVR
+chain down (with a doff grace of about 90 s when the visitor merely removed
+the headset). Idempotent, 204. Call it on user end and best-effort on every
+arming failure path.
+
+### Launching the ALVR client
+
+Explicit intent, hardware-verified:
+
+- Component `alvr.client.stable/android.app.NativeActivity`.
+- Category `com.oculus.intent.category.VR` (without it vrshell rejects the
+  placement).
+- `FLAG_ACTIVITY_NEW_TASK`, started from the current foreground activity.
+  A background or application-context launch is refused by vrshell; treat a
+  missing foreground activity as a launch failure.
+
+### Timing and end semantics
+
+- Arming takes 45 to 90 s, worst about 110 s (chain cold start plus trust).
+  The cluster fails the session after 150 s; the head gives up at 180 s.
+- While `armingXr` or `streamingXr` the heartbeat sends the body id; the
+  cluster stores it as the head's live body for operator attribution. Slot
+  exclusivity comes from the cluster's XR session record, not from the
+  heartbeat. On session end the head still runs the same cleanup as a flat
+  stream end: mark the ended session against the full candidate host set and
+  send the stream DELETE (section 8), so the stale-block guard applies
+  unchanged to any stream block a cluster may serve.
+- An assignment with `stream_mode` == `xr` starts through the same flow. The
+  head prefers the eligible body whose addresses match the assignment's
+  stream URLs, so the admin-pinned body is the one armed.
 
 ## WireGuard head provisioning
 

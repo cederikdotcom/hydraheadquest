@@ -2,6 +2,7 @@ package com.limelight.hydra
 
 import android.content.Context
 import android.net.wifi.WifiManager
+import android.os.SystemClock
 import android.util.Log
 import com.limelight.BuildConfig
 import com.limelight.hydra.model.EligibleBody
@@ -9,6 +10,7 @@ import com.limelight.hydra.model.EnrollmentConfig
 import com.limelight.hydra.model.Experience
 import com.limelight.hydra.model.HeadConfig
 import com.limelight.hydra.model.HeadDiagnostics
+import com.limelight.hydra.model.XrSessionState
 import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
@@ -73,6 +75,13 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
 
         /** Timeout for the Sunshine PIN post. */
         const val PIN_POST_TIMEOUT_MS = 20000
+
+        /**
+         * Head-side cap on the XR arming wait. Sized above the cluster's
+         * 150 s arm timeout plus one poll: the honest worst case for the
+         * ALVR chain cold start is about 110 s (design section 2.2).
+         */
+        const val XR_ARMING_TIMEOUT_SECONDS = 180L
     }
 
     /** Head states, mirroring AppState.swift. */
@@ -98,6 +107,32 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
              * this flag. A stream with no active server assignment is
              * left alone; an active assignment always wins.
              */
+            val selfService: Boolean
+        ) : State()
+
+        /**
+         * The cluster is arming an XR body for this head (issue #558):
+         * ALVR chain start plus client trust take 45 to 90 s, worst
+         * about 110 s. The 5 s tick polls the XR session until it is
+         * armed, failed, or timed out.
+         */
+        data class ArmingXr(
+            val bodyName: String,
+            val host: String,
+            val experience: Experience,
+            val bodyId: String
+        ) : State()
+
+        /**
+         * The ALVR client is launched and the body runs the experience.
+         * The body is the source of truth: the 5 s tick polls the XR
+         * session, and a gone, ending, or failed session IS the end
+         * signal. There is no client-side process detection.
+         */
+        data class StreamingXr(
+            val host: String,
+            val experience: Experience,
+            val bodyId: String,
             val selfService: Boolean
         ) : State()
 
@@ -136,6 +171,25 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
         fun stopStream()
     }
 
+    /**
+     * Integration surface toward the separate ALVR client app (issue
+     * #558). Implemented by [AlvrLauncher]; HydraApp wires the instance
+     * at startup. Kept apart from [StreamHooks] so the flat streaming
+     * integration stays untouched.
+     */
+    interface XrHooks {
+        /** True when the ALVR client package is installed on this headset. */
+        fun isXrClientInstalled(): Boolean
+
+        /**
+         * Launch (or foreground) the ALVR client with the VR category
+         * from the current foreground activity. Returns false when
+         * there is no foreground activity (vrshell rejects VR-category
+         * launches from a background context) or the launch failed.
+         */
+        fun launchXrClient(): Boolean
+    }
+
     private val appContext: Context = context.applicationContext
     private val executor = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "HydraState").apply { isDaemon = true }
@@ -150,6 +204,19 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
 
     @Volatile
     var streamHooks: StreamHooks? = null
+
+    @Volatile
+    var xrHooks: XrHooks? = null
+
+    /**
+     * Supplies this head's own mesh address (the WireGuard Interface
+     * Address, for example "10.10.200.7"), sent as client_ip in the XR
+     * session request so the body can trust the ALVR client at that
+     * address. Null when no tunnel config is stored. HydraApp wires
+     * this to HydraWireGuard.tunnelAddress().
+     */
+    @Volatile
+    var wireguardAddressProvider: (() -> String?)? = null
 
     /**
      * Screenshot provider for the remote screenshot command. Returns JPEG
@@ -224,6 +291,19 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
      * new) assignment arrives. Executor-confined.
      */
     private var endedSession: EndedSession? = null
+
+    /**
+     * Whether the current XR flow was started from the grid. ArmingXr
+     * carries no selfService flag, so this remembers it between the
+     * session request and the StreamingXr state. Executor-confined.
+     */
+    private var xrSelfService: Boolean = false
+
+    /**
+     * When the current XR arming wait started (elapsedRealtime ms), for
+     * the head-side 180 s cap. Executor-confined.
+     */
+    private var xrArmingStartedAt: Long = 0L
 
     // ------------------------------------------------------------------
     // Lifecycle
@@ -552,7 +632,19 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
                         endedSession = null
                         val experience = cachedCatalog.firstOrNull { it.name == appId }
                             ?: Experience(appId, appId, null, false)
-                        startExperience(experience, selfService = false)
+                        if (config.stream?.streamMode == Experience.STREAM_MODE_XR) {
+                            // An XR assignment (issue #558): the stream
+                            // block names the admin-pinned body through
+                            // its URLs, so prefer the eligible body
+                            // matching those hosts.
+                            startXrExperience(
+                                experience,
+                                selfService = false,
+                                preferredHosts = assignmentHosts(config)
+                            )
+                        } else {
+                            startExperience(experience, selfService = false)
+                        }
                     }
                 } else {
                     // No stream block server-side: any earlier session is
@@ -593,6 +685,8 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
                 // No active assignment: a self-service stream. Leave it
                 // alone; it ends only on user exit or on error.
             }
+            is State.ArmingXr -> tickArmingXr(current, apiClient)
+            is State.StreamingXr -> tickStreamingXr(current, apiClient)
             else -> {}
         }
 
@@ -620,6 +714,12 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
     // ------------------------------------------------------------------
 
     private fun startExperience(experience: Experience, selfService: Boolean) {
+        if (experience.isXr) {
+            // The immersive ALVR path (issue #558). The flat flow below
+            // stays byte-identical for every other experience.
+            startXrExperience(experience, selfService)
+            return
+        }
         val apiClient = client ?: return
         val config = cachedConfig
         val headId = enrollment?.headId ?: return
@@ -668,6 +768,309 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
         }
     }
 
+    // ------------------------------------------------------------------
+    // XR session flow (issue #558): request -> arming -> streamingXr
+    // ------------------------------------------------------------------
+
+    /**
+     * Start an XR experience: pre-flight the ALVR client, discover an
+     * XR-capable body, POST the XR session, then wait in [State.ArmingXr]
+     * while the body arms the ALVR chain (design section 4.2).
+     *
+     * [preferredHosts] is non-empty only on the assignment path: the
+     * stream block's hosts name the admin-pinned body, and the eligible
+     * body matching them is preferred so the assignment arms the pinned
+     * body, not merely the first free one.
+     */
+    private fun startXrExperience(
+        experience: Experience,
+        selfService: Boolean,
+        preferredHosts: List<String> = emptyList()
+    ) {
+        val apiClient = client ?: return
+        val config = cachedConfig
+        val headId = enrollment?.headId ?: return
+
+        // Pre-flight: the ALVR client is a separate APK deployed via HMS.
+        // Without it an armed body could never be joined, so fail before
+        // any session request is made.
+        val hooks = xrHooks
+        if (hooks == null || !hooks.isXrClientInstalled()) {
+            setState(State.Error("ALVR client not installed"))
+            return
+        }
+        val clientHostname = config?.xrClientHostname
+        if (config == null || clientHostname.isNullOrEmpty()) {
+            // Admin misconfiguration surfaced clearly instead of as a
+            // trust failure and arm timeout a minute later. The null
+            // config check also gives the smart cast below.
+            setState(State.Error("No ALVR client hostname is configured for this head"))
+            return
+        }
+
+        setState(State.Discovering(experience))
+
+        // This head may already own a session server-side, typically
+        // after an app restart mid-session. Resume it instead of failing
+        // (an engaged body is filtered out of the XR eligible query, and
+        // a new POST would 409 head_busy). An old cluster 404s here,
+        // which the client surfaces as null: nothing changes for it.
+        val existing: XrSessionState? = try {
+            apiClient.getXrSession()
+        } catch (e: IOException) {
+            Log.w(TAG, "xr-session pre-check failed: ${e.message}")
+            null
+        }
+        if (existing != null) {
+            resumeOrClearXrSession(existing, experience, selfService)
+            return
+        }
+
+        try {
+            val bodies = apiClient.getEligibleBodies(
+                district = config.district,
+                venue = config.venue,
+                headId = headId,
+                experience = experience.name,
+                streamMode = Experience.STREAM_MODE_XR
+            )
+            // Client-side re-filter: an old cluster ignores the
+            // stream_mode parameter and returns flat bodies without
+            // xr_drivers, so requiring "alvr" here keeps them out.
+            // streamCount == 0 as on the flat path.
+            val eligible = bodies.filter {
+                it.streamCount == 0 && it.xrDrivers.contains("alvr")
+            }
+            // Assignment path: prefer the pinned body named by the
+            // stream block hosts. Self-service passes no hosts and
+            // takes the first eligible body, as on the flat path.
+            var body: EligibleBody? = null
+            if (preferredHosts.isNotEmpty()) {
+                body = eligible.firstOrNull { candidate ->
+                    candidate.candidateHosts().any { it in preferredHosts }
+                }
+            }
+            if (body == null) {
+                body = eligible.firstOrNull()
+            }
+            if (body == null) {
+                setState(State.Error("No XR bodies available"))
+                return
+            }
+            val bodyId = body.id ?: ""
+            val host = selectHost(body)
+            if (host == null) {
+                setState(State.Error("Body has no reachable IP"))
+                return
+            }
+            // Same capture as the flat path: the tick compares the
+            // server's stream block against the full candidate set (the
+            // v0.4.0 tick-kill guard depends on it).
+            currentBodyHosts = body.candidateHosts()
+            xrSelfService = selfService
+            val meshIp = try {
+                wireguardAddressProvider?.invoke()
+            } catch (e: Exception) {
+                null
+            }
+            // The mesh address is what the body trusts; the local IP is
+            // the same-LAN fallback when no tunnel is configured.
+            val clientIp = meshIp ?: localIpAddress().takeIf { it != "unknown" }
+            apiClient.postXrSession(bodyId, experience.name, clientHostname, clientIp)
+            xrArmingStartedAt = SystemClock.elapsedRealtime()
+            setState(State.ArmingXr(body.name ?: bodyId, host, experience, bodyId))
+            // Streaming cadence: the arming poll runs on the 5 s tick.
+            scheduleTick(STREAMING_TICK_SECONDS)
+        } catch (e: HydraClusterClient.HttpStatusException) {
+            val message = when {
+                e.code == 404 -> "Cluster does not support XR heads"
+                e.message?.contains("body_busy") == true ->
+                    "The body is busy with another session"
+                e.message?.contains("not_xr_capable") == true ->
+                    "The body is not XR capable"
+                // Race fallback only; the pre-check above normally
+                // resumes or ends an existing session before the POST.
+                e.message?.contains("head_busy") == true ->
+                    "This head already has a headset session. Try again in a moment."
+                else -> "Could not start XR session: ${e.message}"
+            }
+            setState(State.Error(message))
+        } catch (e: IOException) {
+            setState(State.Error("Could not start XR session: ${e.message}"))
+        }
+    }
+
+    /**
+     * This head already owns a server-side XR session (found by the
+     * pre-check in [startXrExperience], typically after an app restart
+     * mid-session). A live session for the SAME experience is adopted:
+     * re-enter [State.ArmingXr] and let the poll take it from there (a
+     * restart must never bounce a running session, least of all an
+     * assignment). Anything else is ended so a retry starts clean.
+     */
+    private fun resumeOrClearXrSession(
+        existing: XrSessionState,
+        experience: Experience,
+        selfService: Boolean
+    ) {
+        if (existing.isLive && existing.experience == experience.name) {
+            val bodyId = existing.bodyId ?: ""
+            currentBodyHosts = listOfNotNull(existing.bodyHost)
+            xrSelfService = selfService
+            xrArmingStartedAt = SystemClock.elapsedRealtime()
+            setState(
+                State.ArmingXr(bodyId, existing.bodyHost ?: "", experience, bodyId)
+            )
+            scheduleTick(STREAMING_TICK_SECONDS)
+            return
+        }
+        try {
+            client?.deleteXrSession()
+        } catch (e: IOException) {
+            Log.w(TAG, "deleteXrSession on stale session failed: ${e.message}")
+        }
+        setState(State.Error("A previous headset session is ending. Try again in a moment."))
+        scheduleTick(IDLE_TICK_SECONDS)
+    }
+
+    /** Seconds spent in the current arming wait. */
+    private fun xrArmingElapsedSeconds(): Long =
+        (SystemClock.elapsedRealtime() - xrArmingStartedAt) / 1000
+
+    /**
+     * Arming poll, on the 5 s tick. Armed => launch the ALVR client.
+     * Failed, gone, ending, or over the 180 s cap => end with an error.
+     * Anything else (requested, arming) => keep waiting.
+     */
+    private fun tickArmingXr(current: State.ArmingXr, apiClient: HydraClusterClient) {
+        val session: XrSessionState? = try {
+            apiClient.getXrSession()
+        } catch (e: IOException) {
+            Log.w(TAG, "xr-session poll failed: ${e.message}")
+            // Transient failure: keep waiting unless the cap is blown.
+            if (xrArmingElapsedSeconds() <= XR_ARMING_TIMEOUT_SECONDS) return
+            null
+        }
+        when {
+            // "active" covers a body that resumed a session after a
+            // hydrabody restart with the client already connected.
+            session?.state == "armed" || session?.state == "active" -> {
+                val hooks = xrHooks
+                if (hooks == null || !hooks.launchXrClient()) {
+                    // No foreground activity (vrshell would reject the
+                    // VR-category launch) or the launch threw.
+                    endXrArming(current, "Could not launch the ALVR client")
+                    return
+                }
+                setState(
+                    State.StreamingXr(
+                        current.host, current.experience, current.bodyId, xrSelfService
+                    )
+                )
+                // Already on the 5 s cadence; the StreamingXr poll keeps it.
+            }
+            session == null ||
+                session.state == "failed" ||
+                session.state == "ending" ||
+                xrArmingElapsedSeconds() > XR_ARMING_TIMEOUT_SECONDS -> {
+                endXrArming(current, session?.reason)
+            }
+            else -> {
+                // requested or arming: keep waiting on the 5 s tick.
+            }
+        }
+    }
+
+    /** Arming failed or timed out: delete, mark, error, idle cadence. */
+    private fun endXrArming(current: State.ArmingXr, reason: String?) {
+        try {
+            client?.deleteXrSession()
+        } catch (e: IOException) {
+            Log.w(TAG, "deleteXrSession on arming end failed: ${e.message}")
+        }
+        markEndedXr(current.bodyId, current.experience.name, xrSelfService)
+        val message = reason?.takeIf { it.isNotEmpty() }
+            ?.let { "Headset session failed: $it" }
+            ?: "Headset session could not start"
+        setState(State.Error(message))
+        scheduleTick(IDLE_TICK_SECONDS)
+    }
+
+    /**
+     * XR session poll while streaming. The body is the source of truth:
+     * a gone (404), ending, or failed session IS the end signal. A
+     * transport failure is transient and never ends the session.
+     */
+    private fun tickStreamingXr(current: State.StreamingXr, apiClient: HydraClusterClient) {
+        val session: XrSessionState? = try {
+            apiClient.getXrSession()
+        } catch (e: IOException) {
+            Log.w(TAG, "xr-session poll failed: ${e.message}")
+            return
+        }
+        if (session == null || session.state == "ending" || session.state == "failed") {
+            // Ended: doff grace expired, the user pressed End, or the
+            // body failed. Same cleanup as onStreamEnded: send the
+            // stream DELETE and mark the ended session, so any stale
+            // stream block a cluster may still serve (#137) is guarded.
+            markEndedXr(current.bodyId, current.experience.name, current.selfService)
+            try {
+                client?.deleteStream(current.bodyId)
+            } catch (e: IOException) {
+                Log.w(TAG, "deleteStream on xr end failed: ${e.message}")
+            }
+            setState(State.SelfService(cachedCatalog))
+            scheduleTick(IDLE_TICK_SECONDS)
+        }
+        // Any live state (armed, active, draining): leave it alone. A
+        // draining body is inside its doff grace and may resume.
+    }
+
+    /**
+     * XR twin of [markEnded]: remember a self-service XR session on its
+     * way out, fed from the captured candidate host set, so the tick
+     * never relaunches it from the head's own stale stream block.
+     * Assignment sessions are NOT marked, same as on flat.
+     */
+    private fun markEndedXr(bodyId: String, app: String, selfService: Boolean) {
+        if (!selfService) return
+        endedSession = EndedSession(
+            bodyId = bodyId,
+            app = app,
+            hosts = currentBodyHosts
+        )
+    }
+
+    /**
+     * The user tapped End session on the catalog while in an XR session.
+     * DELETE marks the session ending server-side; the body tears down
+     * on its next poll. The immediate tick runs the common end path
+     * without waiting up to 5 s. Never kills anything locally: the body
+     * may be inside its doff grace.
+     */
+    fun onUserEndXrSession() {
+        executor.execute {
+            if (state !is State.StreamingXr) return@execute
+            try {
+                client?.deleteXrSession()
+            } catch (e: IOException) {
+                Log.w(TAG, "deleteXrSession on user end failed: ${e.message}")
+            }
+            safeTick()
+        }
+    }
+
+    /** The user tapped Return to experience: bring the ALVR client forward. */
+    fun onReturnToXr() {
+        executor.execute {
+            if (state !is State.StreamingXr) return@execute
+            val hooks = xrHooks
+            if (hooks == null || !hooks.launchXrClient()) {
+                Log.w(TAG, "could not return to the ALVR client")
+            }
+        }
+    }
+
     /**
      * Pick a reachable host for the body. Probe each candidate on TCP 47990
      * with a 1 s timeout: LAN ip first, then the WireGuard ip, then the ip
@@ -705,7 +1108,17 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
     private fun sendHeartbeat(apiClient: HydraClusterClient) {
         val current = state
         val status = statusFor(current)
-        val bodyId = (current as? State.Streaming)?.bodyId
+        // XR states report their body too: the cluster stores it as the
+        // head's live body for operator attribution. XR slot exclusivity
+        // itself comes from the cluster's XRSession record, and the XR
+        // end path still runs the flat-style cleanup so any stale stream
+        // block a cluster may serve (#137) stays guarded.
+        val bodyId = when (current) {
+            is State.Streaming -> current.bodyId
+            is State.ArmingXr -> current.bodyId
+            is State.StreamingXr -> current.bodyId
+            else -> null
+        }
         try {
             apiClient.putHeartbeat(status, bodyId, collectDiagnostics())
         } catch (e: IOException) {
@@ -744,6 +1157,14 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
         } catch (e: Exception) {
             "error: ${e.message ?: "status failed"}".take(70)
         }
+        // "alvr" while an XR session is arming or running, so the
+        // operator table and the heartbeat agree; absent otherwise.
+        val current = state
+        val xrClient = if (current is State.ArmingXr || current is State.StreamingXr) {
+            "alvr"
+        } else {
+            null
+        }
         return HeadDiagnostics(
             version = "v" + BuildConfig.VERSION_NAME,
             wireguard = wireguardStatus,
@@ -751,7 +1172,8 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
             latencyMs = latency,
             wifiSsid = currentSsid(),
             localIp = localIpAddress(),
-            moonlightClientId = clientId
+            moonlightClientId = clientId,
+            xrClient = xrClient
         )
     }
 
@@ -760,6 +1182,8 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
         is State.SelfService -> "self-service"
         is State.Discovering, is State.Pairing -> "starting"
         is State.Streaming -> "streaming"
+        is State.ArmingXr -> "pairing"
+        is State.StreamingXr -> "streaming-xr"
         is State.Error -> "error"
     }
 

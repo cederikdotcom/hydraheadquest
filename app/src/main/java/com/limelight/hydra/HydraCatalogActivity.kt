@@ -74,6 +74,7 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
     private lateinit var statusMessage: TextView
     private lateinit var statusSpinner: ProgressBar
     private lateinit var statusButton: Button
+    private lateinit var statusSecondaryButton: Button
     private lateinit var identityView: TextView
 
     private var experiences: List<Experience> = emptyList()
@@ -184,6 +185,19 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
                 "The experience is running.",
                 "Stop"
             ) { hydraState.onUserStop() }
+            is HydraState.State.ArmingXr -> showStatus(
+                "Starting ${state.experience.label}",
+                "Preparing headset stream... (this takes about a minute)",
+                null, null
+            )
+            is HydraState.State.StreamingXr -> showStatusXr(
+                "In headset: ${state.experience.label}",
+                "The experience is running in the headset.",
+                "Return to experience",
+                { hydraState.onReturnToXr() },
+                "End session",
+                { hydraState.onUserEndXrSession() }
+            )
             is HydraState.State.Error -> showStatus(
                 "Something went wrong",
                 state.message,
@@ -218,6 +232,29 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
             statusSpinner.visibility = View.VISIBLE
             statusButton.visibility = View.GONE
         }
+        // Only the XR session view uses the second button; every other
+        // status render hides it.
+        statusSecondaryButton.visibility = View.GONE
+    }
+
+    /**
+     * Status panel with two actions, used only by the XR session view
+     * (Return to experience / End session). A separate method instead of
+     * more showStatus parameters, so the flat render calls stay
+     * byte-identical and no trailing lambda can rebind.
+     */
+    private fun showStatusXr(
+        title: String,
+        message: String,
+        primaryLabel: String,
+        primaryAction: () -> Unit,
+        secondaryLabel: String,
+        secondaryAction: () -> Unit
+    ) {
+        showStatus(title, message, primaryLabel, primaryAction)
+        statusSecondaryButton.visibility = View.VISIBLE
+        statusSecondaryButton.text = secondaryLabel
+        statusSecondaryButton.setOnClickListener { secondaryAction() }
     }
 
     private fun populateGrid() {
@@ -246,6 +283,9 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
             typeface = Typeface.DEFAULT_BOLD
         }
         val details = mutableListOf<String>()
+        if (experience.isXr) {
+            details.add("XR")
+        }
         details.add(if (experience.isPortrait) "Portrait" else "Landscape")
         if (experience.enableMicrophone) {
             details.add("Microphone")
@@ -841,6 +881,7 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
             "wifi_ssid" to "${d.wifiSsid}",
             "local_ip" to "${d.localIp}",
             "moonlight_client_id" to (d.moonlightClientId ?: "-"),
+            "xr_client" to (d.xrClient ?: "-"),
             "stream_host" to (config?.streamHost ?: "-"),
             "stream_app_id" to (config?.stream?.streamAppId ?: "-")
         )
@@ -1211,6 +1252,8 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
             visibility = View.GONE
         }
         statusButton = HydraUi.bigButton(this, "", primary = true) {}
+        statusSecondaryButton = HydraUi.bigButton(this, "", primary = false) {}
+        statusSecondaryButton.visibility = View.GONE
         statusPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -1226,6 +1269,16 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
             )
             addView(
                 statusButton,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    gravity = Gravity.CENTER_HORIZONTAL
+                    topMargin = dp(HydraUi.SPACE_S)
+                }
+            )
+            addView(
+                statusSecondaryButton,
                 LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT

@@ -262,6 +262,19 @@ class HydraWireGuard(context: Context) {
         }
     }
 
+    /**
+     * This head's own mesh address from the stored config's Address
+     * line, without the CIDR suffix (for example "10.10.200.7"), or
+     * null when no config is stored or the line is missing. Sent as
+     * client_ip in the XR session request. Parsing only; the config
+     * text is never logged.
+     */
+    fun tunnelAddress(): String? {
+        val text = loadStoredConfig() ?: return null
+        val match = Regex("(?im)^\\s*Address\\s*=\\s*([0-9.]+)").find(text) ?: return null
+        return match.groupValues[1]
+    }
+
     /** Human-readable handshake line for the diagnostics view. */
     fun lastHandshakeDescription(): String {
         if (!isUp()) return "tunnel not up"

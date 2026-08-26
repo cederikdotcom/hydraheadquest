@@ -84,7 +84,14 @@ data class HeadConfig(
     val venue: String?,
     val stream: StreamAssignment?,
     val sunshineUsername: String?,
-    val sunshinePassword: String?
+    val sunshinePassword: String?,
+    /**
+     * The ALVR client hostname of this head (for example "0529.client"),
+     * set once by an admin. Echoed as client_hostname in the XR session
+     * request so the body can trust the client. Absent on flat heads;
+     * the default keeps older positional constructions compiling.
+     */
+    val xrClientHostname: String? = null
 ) {
     /** An assignment is active when stream_url AND stream_app_id are non-empty. */
     val hasActiveAssignment: Boolean
@@ -122,7 +129,8 @@ data class HeadConfig(
                 venue = obj.optString("venue", "").ifEmpty { null },
                 stream = streamObj?.let { StreamAssignment.fromJson(it) },
                 sunshineUsername = obj.optString("sunshine_username", "").ifEmpty { null },
-                sunshinePassword = obj.optString("sunshine_password", "").ifEmpty { null }
+                sunshinePassword = obj.optString("sunshine_password", "").ifEmpty { null },
+                xrClientHostname = obj.optString("xr_client_hostname", "").ifEmpty { null }
             )
         }
 
@@ -148,10 +156,20 @@ data class Experience(
     val name: String,
     val label: String,
     val orientation: String?,
-    val enableMicrophone: Boolean
+    val enableMicrophone: Boolean,
+    /**
+     * Optional "stream_mode": "xr" selects the immersive ALVR path,
+     * absent or any other value the flat Moonlight path. The default
+     * keeps older positional constructions compiling as flat.
+     */
+    val streamMode: String? = null
 ) {
     val isPortrait: Boolean
         get() = orientation == "portrait"
+
+    /** True when this experience runs the immersive XR path. */
+    val isXr: Boolean
+        get() = streamMode == STREAM_MODE_XR
 
     /** Portrait streams 1080x1920, everything else 1920x1080. */
     val streamWidth: Int
@@ -161,13 +179,17 @@ data class Experience(
         get() = if (isPortrait) 1920 else 1080
 
     companion object {
+        /** stream_mode value that selects the immersive XR path. */
+        const val STREAM_MODE_XR = "xr"
+
         fun fromJson(obj: JSONObject): Experience {
             val name = obj.optString("name", "")
             return Experience(
                 name = name,
                 label = obj.optString("label", "").ifEmpty { name },
                 orientation = obj.optString("orientation", "").ifEmpty { null },
-                enableMicrophone = obj.optBoolean("enable_microphone", false)
+                enableMicrophone = obj.optBoolean("enable_microphone", false),
+                streamMode = obj.optString("stream_mode", "").ifEmpty { null }
             )
         }
 
@@ -193,7 +215,14 @@ data class EligibleBody(
     val ip: String?,
     val wireguardIp: String?,
     val sameVenue: Boolean,
-    val streamCount: Int
+    val streamCount: Int,
+    /**
+     * XR drivers the body advertises (for example ["alvr"]). Empty on
+     * old clusters and on flat bodies; empty means not XR capable.
+     */
+    val xrDrivers: List<String> = emptyList(),
+    /** Body XR state (idle, arming, armed, active, draining, failed). */
+    val xrState: String? = null
 ) {
     /**
      * Candidate hosts in probe order:
@@ -230,6 +259,19 @@ data class EligibleBody(
         }
 
         fun fromJson(obj: JSONObject): EligibleBody {
+            val driversArr = obj.optJSONArray("xr_drivers")
+            val drivers: List<String> = if (driversArr == null) {
+                emptyList()
+            } else {
+                val list = ArrayList<String>(driversArr.length())
+                for (i in 0 until driversArr.length()) {
+                    val value = driversArr.optString(i, "")
+                    if (value.isNotEmpty()) {
+                        list.add(value)
+                    }
+                }
+                list
+            }
             return EligibleBody(
                 id = obj.optString("id", "").ifEmpty { null },
                 name = obj.optString("name", "").ifEmpty { null },
@@ -237,7 +279,9 @@ data class EligibleBody(
                 wireguardIp = obj.optString("wireguard_ip", "").ifEmpty { null },
                 sameVenue = obj.optBoolean("same_venue", false),
                 // A missing stream_count counts as 0 (free body).
-                streamCount = obj.optInt("stream_count", 0)
+                streamCount = obj.optInt("stream_count", 0),
+                xrDrivers = drivers,
+                xrState = obj.optString("xr_state", "").ifEmpty { null }
             )
         }
 
@@ -249,6 +293,42 @@ data class EligibleBody(
                 out.add(fromJson(obj))
             }
             return out
+        }
+    }
+}
+
+/**
+ * State of this head's XR session, from POST or GET
+ * /api/v1/heads/{head_id}/xr-session. All fields optional on the wire.
+ * `state` is one of requested, arming, armed, active, draining, ending,
+ * failed; a 404 on the GET (no session) is surfaced as null by the
+ * client, not as a model value.
+ */
+data class XrSessionState(
+    val sessionId: String?,
+    val state: String?,
+    val bodyId: String?,
+    val bodyHost: String?,
+    val reason: String?,
+    /** The experience the session runs, for resume-after-restart matching. */
+    val experience: String? = null
+) {
+    /** True while the session can still serve the head. */
+    val isLive: Boolean
+        get() = state == "requested" || state == "arming" || state == "armed" ||
+            state == "active" || state == "draining"
+
+    companion object {
+        fun fromJson(json: String): XrSessionState {
+            val obj = JSONObject(json)
+            return XrSessionState(
+                sessionId = obj.optString("session_id", "").ifEmpty { null },
+                state = obj.optString("state", "").ifEmpty { null },
+                bodyId = obj.optString("body_id", "").ifEmpty { null },
+                bodyHost = obj.optString("body_host", "").ifEmpty { null },
+                reason = obj.optString("reason", "").ifEmpty { null },
+                experience = obj.optString("experience", "").ifEmpty { null }
+            )
         }
     }
 }
@@ -273,7 +353,12 @@ data class HeadDiagnostics(
     val latencyMs: String,
     val wifiSsid: String,
     val localIp: String,
-    val moonlightClientId: String?
+    val moonlightClientId: String?,
+    /**
+     * "alvr" while an XR session is arming or running, absent otherwise.
+     * Additive: the field is omitted from the JSON when null.
+     */
+    val xrClient: String? = null
 ) {
     fun toJson(): JSONObject {
         val obj = JSONObject()
@@ -285,6 +370,9 @@ data class HeadDiagnostics(
         obj.put("wifi_ssid", wifiSsid)
         obj.put("local_ip", localIp)
         obj.put("moonlight_client_id", moonlightClientId ?: JSONObject.NULL)
+        if (xrClient != null) {
+            obj.put("xr_client", xrClient)
+        }
         return obj
     }
 }

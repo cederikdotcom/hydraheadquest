@@ -76,8 +76,10 @@ class HydraApp : Application() {
         hydraState = HydraState(this, HydraConfigStore(this))
         streamHooks = HydraStreamHooks(this, hydraState)
         hydraState.streamHooks = streamHooks
+        hydraState.xrHooks = AlvrLauncher(this)
         hydraState.moonlightClientIdProvider = { moonlightClientId }
         hydraState.wireguardStatusProvider = { hydraWireGuard.statusString() }
+        hydraState.wireguardAddressProvider = { hydraWireGuard.tunnelAddress() }
         hydraState.screenshotProvider = {
             currentActivity?.let { HydraScreenshot.capture(it) }
         }
