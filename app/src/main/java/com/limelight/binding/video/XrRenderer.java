@@ -1166,7 +1166,13 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
             value.setTextAlign(Paint.Align.RIGHT);
 
             float y = 106.0f;
-            for (String[] row : diagnosticsRows(d)) {
+            String[][] rows;
+            if (d == null) {
+                rows = StreamDiagnostics.placeholderRows();
+            } else {
+                rows = d.rows();
+            }
+            for (String[] row : rows) {
                 canvas.drawText(row[0], 24.0f, y, label);
                 canvas.drawText(row[1], DIAG_TEX_W - 24.0f, y, value);
                 y += 38.0f;
@@ -1181,73 +1187,6 @@ public class XrRenderer implements SurfaceTexture.OnFrameAvailableListener {
         }
     }
 
-    // Two columns, iPad panel parity. Placeholders until the numbers exist.
-    private static String[][] diagnosticsRows(StreamDiagnostics d) {
-        final String na = "--";
-        if (d == null) {
-            return new String[][] {
-                    { "Route", na }, { "Body", na }, { "Codec", na },
-                    { "Stream", na }, { "Bitrate", na }, { "RTT", na },
-                    { "RTT variance", na }, { "FPS incoming", na },
-                    { "FPS rendered", na }, { "Net drops", na },
-                    { "Host latency", na }, { "Host min / max", na },
-                    { "Decode time", na },
-            };
-        }
-        // Deliberately verbose: v0.7.0 built this table with conditional
-        // expressions inside the array initializer and ART's verifier
-        // rejected the method (copy1 type=Undefined) at class load, taking
-        // the whole XrRenderer class and the app down. Plain locals only.
-        boolean hasRtt = d.rttMs > 0 || d.rttVarianceMs > 0;
-        String route = na;
-        if (d.route != null) route = d.route;
-        String body = na;
-        if (d.bodyHost != null) body = d.bodyHost;
-        String codec = na;
-        if (d.codec != null) codec = d.codec;
-        String stream = na;
-        if (d.width > 0) {
-            stream = d.width + "x" + d.height + " @ " + d.targetFps;
-        }
-        String bitrate = na;
-        if (d.bitrateKbps > 0) {
-            bitrate = String.format("%.1f Mbps", d.bitrateKbps / 1000.0f);
-        }
-        String rtt = na;
-        String rttVar = na;
-        if (hasRtt) {
-            rtt = d.rttMs + " ms";
-            rttVar = d.rttVarianceMs + " ms";
-        }
-        String fpsIn = String.format("%.1f", d.incomingFps);
-        String fpsOut = String.format("%.1f", d.renderedFps);
-        String drops = String.format("%.1f %%", d.netDropPercent);
-        String hostAvg = na;
-        String hostMinMax = na;
-        if (d.hasHostLatency) {
-            hostAvg = String.format("%.1f ms", d.hostLatencyAvgMs);
-            hostMinMax = String.format("%.1f / %.1f ms", d.hostLatencyMinMs, d.hostLatencyMaxMs);
-        }
-        String decode = na;
-        if (d.decodeTimeMs >= 0.0f) {
-            decode = String.format("%.1f ms", d.decodeTimeMs);
-        }
-        return new String[][] {
-                { "Route", route },
-                { "Body", body },
-                { "Codec", codec },
-                { "Stream", stream },
-                { "Bitrate", bitrate },
-                { "RTT", rtt },
-                { "RTT variance", rttVar },
-                { "FPS incoming", fpsIn },
-                { "FPS rendered", fpsOut },
-                { "Net drops", drops },
-                { "Host latency", hostAvg },
-                { "Host min / max", hostMinMax },
-                { "Decode time", decode },
-        };
-    }
 
     private static String msPer(long totalNs, long count) {
         return String.format("%.2f", totalNs / (double)count / 1000000.0);
