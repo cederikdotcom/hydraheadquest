@@ -173,13 +173,13 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
             is HydraState.State.Discovering -> showStatus(
                 "Starting ${state.experience.label}",
                 "Finding a body for this experience...",
-                null, null
-            )
+                "Cancel"
+            ) { hydraState.onUserCancelStart() }
             is HydraState.State.Pairing -> showStatus(
                 "Starting ${state.experience.label}",
                 "Pairing with ${state.bodyName}...",
-                null, null
-            )
+                "Cancel"
+            ) { hydraState.onUserCancelStart() }
             is HydraState.State.Streaming -> showStatus(
                 "Streaming ${state.experience.label}",
                 "The experience is running.",
@@ -188,8 +188,8 @@ class HydraCatalogActivity : Activity(), HydraState.Listener {
             is HydraState.State.ArmingXr -> showStatus(
                 "Starting ${state.experience.label}",
                 "Preparing headset stream... (this takes about a minute)",
-                null, null
-            )
+                "Cancel"
+            ) { hydraState.onUserCancelStart() }
             is HydraState.State.StreamingXr -> showStatusXr(
                 "In headset: ${state.experience.label}",
                 "The experience is running in the headset.",

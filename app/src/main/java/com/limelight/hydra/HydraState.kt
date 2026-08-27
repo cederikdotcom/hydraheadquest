@@ -418,6 +418,24 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
      * The user stopped the stream. Await the DELETE before showing the grid,
      * so the body's slot is free when the catalog reappears.
      */
+    /**
+     * Cancel a start in progress (Discovering, Pairing, or ArmingXr).
+     * Added after hardware testing: a start that hangs left the kiosk
+     * with a spinner and no way out.
+     */
+    fun onUserCancelStart() {
+        executor.execute {
+            when (val current = state) {
+                is State.ArmingXr -> endXrArming(current, "Cancelled")
+                is State.Discovering, is State.Pairing -> {
+                    setState(State.SelfService(cachedCatalog))
+                    scheduleTick(IDLE_TICK_SECONDS)
+                }
+                else -> {}
+            }
+        }
+    }
+
     fun onUserStop() {
         executor.execute {
             val current = state
@@ -572,8 +590,11 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
     private fun safeTick() {
         try {
             tick()
-        } catch (e: Exception) {
-            Log.w(TAG, "tick failed: ${e.message}")
+        } catch (t: Throwable) {
+            // Throwable, not Exception: a linkage error (VerifyError,
+            // NoClassDefFoundError) must be visible too. The scheduled
+            // executor otherwise swallows anything a task throws.
+            Log.e(TAG, "tick failed", t)
         }
     }
 
@@ -738,6 +759,7 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
                 return
             }
             val bodyId = body.id ?: ""
+            Log.i(TAG, "xr body chosen: ${body.name} ($bodyId), probing hosts")
             val host = selectHost(body)
             if (host == null) {
                 setState(State.Error("Body has no reachable IP"))
@@ -810,6 +832,28 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
 
         setState(State.Discovering(experience))
 
+        try {
+            startXrExperienceInner(experience, selfService, preferredHosts, apiClient, config, headId, clientHostname)
+        } catch (t: Throwable) {
+            // The scheduled executor swallows uncaught throwables without
+            // a trace (three silent deaths on hardware, 2026-08-27), so
+            // everything is caught here, logged, and surfaced.
+            Log.e(TAG, "xr start crashed", t)
+            setState(State.Error("XR start failed: ${t.javaClass.simpleName}: ${t.message}"))
+            scheduleTick(IDLE_TICK_SECONDS)
+        }
+    }
+
+    private fun startXrExperienceInner(
+        experience: Experience,
+        selfService: Boolean,
+        preferredHosts: List<String>,
+        apiClient: HydraClusterClient,
+        config: HeadConfig,
+        headId: String,
+        clientHostname: String
+    ) {
+        Log.i(TAG, "xr start: ${experience.name} selfService=$selfService")
         // This head may already own a session server-side, typically
         // after an app restart mid-session. Resume it instead of failing
         // (an engaged body is filtered out of the XR eligible query, and
@@ -821,6 +865,7 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
             Log.w(TAG, "xr-session pre-check failed: ${e.message}")
             null
         }
+        Log.i(TAG, "xr pre-check: existing=${existing?.state ?: "none"}")
         if (existing != null) {
             resumeOrClearXrSession(existing, experience, selfService)
             return
@@ -841,6 +886,7 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
             val eligible = bodies.filter {
                 it.streamCount == 0 && it.xrDrivers.contains("alvr")
             }
+            Log.i(TAG, "xr eligible: ${bodies.size} bodies, ${eligible.size} xr-capable")
             // Assignment path: prefer the pinned body named by the
             // stream block hosts. Self-service passes no hosts and
             // takes the first eligible body, as on the flat path.
@@ -858,6 +904,7 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
                 return
             }
             val bodyId = body.id ?: ""
+            Log.i(TAG, "xr body chosen: ${body.name} ($bodyId), probing hosts")
             val host = selectHost(body)
             if (host == null) {
                 setState(State.Error("Body has no reachable IP"))
@@ -876,7 +923,9 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
             // The mesh address is what the body trusts; the local IP is
             // the same-LAN fallback when no tunnel is configured.
             val clientIp = meshIp ?: localIpAddress().takeIf { it != "unknown" }
+            Log.i(TAG, "xr posting session: body=$bodyId host=$host clientIp=$clientIp")
             apiClient.postXrSession(bodyId, experience.name, clientHostname, clientIp)
+            Log.i(TAG, "xr session created, arming")
             xrArmingStartedAt = SystemClock.elapsedRealtime()
             setState(State.ArmingXr(body.name ?: bodyId, host, experience, bodyId))
             // Streaming cadence: the arming poll runs on the 5 s tick.
