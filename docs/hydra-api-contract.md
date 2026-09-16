@@ -161,9 +161,26 @@ Field rules:
 - `wifi_ssid`: current Wi-Fi SSID.
 - `local_ip`: the device's local IP address.
 - `moonlight_client_id`: the Moonlight unique client id. May be null.
-- `xr_client`: optional. The literal string `alvr` while an XR session is
-  arming or running. Omitted otherwise. The operator diagnostics view shows
-  the same value.
+- `xr_client`: optional. The VR driver in use while an XR session is arming
+  or running, one of `alvr` or `wivrn`. Omitted otherwise. The operator
+  diagnostics view shows the same value. This was the literal string `alvr`
+  while alvr was the only driver.
+- `xr_drivers`: optional array. Every VR driver this head can speak, in
+  preference order, derived from the client packages actually installed:
+  `["wivrn"]`, `["alvr"]`, or both. Omitted when empty, so a head with no
+  VR driver client changes nothing.
+
+  This is the head's half of the capability question a body answers with the
+  same field name. The cluster matches the two instead of assuming alvr, and
+  `POST /api/v1/heads/{id}/xr-session` takes an optional `driver` that
+  defaults to `alvr` for exactly that reason (hydracluster v2.0.120 and
+  v2.0.121).
+
+  The drivers are peers: `alvr`, `wivrn`, and `picobusinessstreaming` when
+  that lane lands. Sunshine and Moonlight are the flat lane and never appear
+  here. WiVRn is preferred where both are installed, since its server runs
+  on Linux bodies and carries the PyroWave codec; ALVR remains the answer
+  for a Windows body, which WiVRn's Monado-based server cannot serve.
 
 No response body is consumed. Only the status code matters.
 
