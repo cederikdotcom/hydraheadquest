@@ -68,11 +68,19 @@
         android:name="android.hardware.type.pc"
         android:required="false"/>
 
-    <!-- Package visibility for the separate ALVR client APK (issue #558).
-         Android 11+ filters getPackageInfo without this; the XR pre-flight
-         check needs it before launching the client by explicit intent -->
+    <!-- Package visibility for the separate VR driver client APKs
+         (issues #558, #739). Android 11+ filters getPackageInfo without
+         this; the XR pre-flight check needs it before launching a client
+         by explicit intent. ALVR and WiVRn are peers: which one a session
+         uses is decided by the driver the body advertises.
+         org.meumeu.wivrn.github.testing is the debug-signed build used for
+         the first PyroWave tests; it is listed so a developer headset can
+         be told apart from a production one, never to be launched as if it
+         were the real client -->
     <queries>
         <package android:name="alvr.client.stable" />
+        <package android:name="com.experiencenet.hydraxr" />
+        <package android:name="org.meumeu.wivrn.github.testing" />
     </queries>
 
     <!-- VR headsets. Optional so phones and TVs are unaffected -->

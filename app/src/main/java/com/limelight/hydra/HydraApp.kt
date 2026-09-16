@@ -76,7 +76,12 @@ class HydraApp : Application() {
         hydraState = HydraState(this, HydraConfigStore(this))
         streamHooks = HydraStreamHooks(this, hydraState)
         hydraState.streamHooks = streamHooks
-        hydraState.xrHooks = AlvrLauncher(this)
+        // Preferred installed VR driver. WiVRn wins where both are present;
+        // ALVR remains the answer for a Windows body, whose bodies WiVRn
+        // cannot serve at all. A session that names a driver overrides this
+        // through XrDrivers.launcher().
+        hydraState.xrHooks = XrDrivers.launcher(this, null) ?: AlvrLauncher(this)
+        hydraState.xrDriversProvider = { XrDrivers.installed(this) }
         hydraState.moonlightClientIdProvider = { moonlightClientId }
         hydraState.wireguardStatusProvider = { hydraWireGuard.statusString() }
         hydraState.wireguardAddressProvider = { hydraWireGuard.tunnelAddress() }
