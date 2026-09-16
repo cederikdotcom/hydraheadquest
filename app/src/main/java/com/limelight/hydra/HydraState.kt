@@ -178,7 +178,13 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
      * integration stays untouched.
      */
     interface XrHooks {
-        /** True when the ALVR client package is installed on this headset. */
+        /**
+         * The VR driver this launcher speaks, named as the cluster names
+         * it in xr_drivers: "alvr", "wivrn".
+         */
+        val driverName: String
+
+        /** True when this driver's client package is installed. */
         fun isXrClientInstalled(): Boolean
 
         /**
@@ -236,6 +242,17 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
      */
     @Volatile
     var moonlightClientIdProvider: (() -> String?)? = null
+
+    /**
+     * Supplies the VR drivers this headset can speak, in preference order,
+     * for the heartbeat. A body advertises what it can serve in
+     * xr_drivers; this is the head's half of the same question, and it is
+     * what lets the cluster match the two instead of assuming alvr.
+     * Empty before wiring, which reads as "no VR driver installed".
+     */
+    @Volatile
+    var xrDriversProvider: (() -> List<String>)? = null
+
 
     /**
      * Supplies the live WireGuard tunnel status for heartbeat diagnostics.
@@ -813,12 +830,13 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
         val config = cachedConfig
         val headId = enrollment?.headId ?: return
 
-        // Pre-flight: the ALVR client is a separate APK deployed via HMS.
-        // Without it an armed body could never be joined, so fail before
-        // any session request is made.
+        // Pre-flight: the VR driver client is a separate APK. Without it
+        // an armed body could never be joined, so fail before any session
+        // request is made. Which client this is depends on the driver:
+        // alvr for a Windows body, wivrn for a Linux one.
         val hooks = xrHooks
         if (hooks == null || !hooks.isXrClientInstalled()) {
-            setState(State.Error("ALVR client not installed"))
+            setState(State.Error("No VR driver client installed on this headset"))
             return
         }
         val clientHostname = config?.xrClientHostname
@@ -1206,13 +1224,20 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
         } catch (e: Exception) {
             "error: ${e.message ?: "status failed"}".take(70)
         }
-        // "alvr" while an XR session is arming or running, so the
-        // operator table and the heartbeat agree; absent otherwise.
+        // The driver actually in use while an XR session is arming or
+        // running, so the operator table and the heartbeat agree; absent
+        // otherwise. Reporting a hardcoded "alvr" here was honest only
+        // while alvr was the sole driver.
         val current = state
         val xrClient = if (current is State.ArmingXr || current is State.StreamingXr) {
-            "alvr"
+            xrHooks?.driverName ?: XrDrivers.ALVR
         } else {
             null
+        }
+        val xrDrivers = try {
+            xrDriversProvider?.invoke() ?: emptyList()
+        } catch (e: Exception) {
+            emptyList()
         }
         return HeadDiagnostics(
             version = "v" + BuildConfig.VERSION_NAME,
@@ -1222,7 +1247,8 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
             wifiSsid = currentSsid(),
             localIp = localIpAddress(),
             moonlightClientId = clientId,
-            xrClient = xrClient
+            xrClient = xrClient,
+            xrDrivers = xrDrivers
         )
     }
 

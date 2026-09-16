@@ -42,6 +42,8 @@ class AlvrLauncher(context: Context) : HydraState.XrHooks {
 
     private val appContext: Context = context.applicationContext
 
+    override val driverName: String = XrDrivers.ALVR
+
     override fun isXrClientInstalled(): Boolean {
         return try {
             appContext.packageManager.getPackageInfo(ALVR_PACKAGE, 0)

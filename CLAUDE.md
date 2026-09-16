@@ -38,9 +38,13 @@ experience catalog, and receives Moonlight streams from Sunshine bodies.
   1. Flat streaming in VR from existing Windows Sunshine bodies. No body changes.
   2. Fleet deploy via Meta Horizon Managed Services (HMS, Shared Mode). CI
      publishes the APK to releases.experiencenet.com; HMS installs from that URL.
-  3. Immersive 6DoF via ALVR (Windows) or WiVRn (Linux). Separate APK, deployed
-     via HMS. hydraheadquest launches it by intent when an experience has
+  3. Immersive 6DoF via ALVR (Windows) or WiVRn (Linux). Separate APK.
+     hydraheadquest launches it by intent when an experience has
      `stream_mode: xr`. Do not merge an XR client into this APK.
+     Distribution superseded 2026-09-16: the owner ruled no Meta release, so
+     HMS is out and side-loading is acceptable for now. See issue #739.
+     The VR drivers are peers: `alvr`, `wivrn`, `picobusinessstreaming`.
+     Sunshine and Moonlight are the flat lane, not a driver.
 
 ## Build
 

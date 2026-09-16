@@ -355,10 +355,18 @@ data class HeadDiagnostics(
     val localIp: String,
     val moonlightClientId: String?,
     /**
-     * "alvr" while an XR session is arming or running, absent otherwise.
-     * Additive: the field is omitted from the JSON when null.
+     * The VR driver in use while an XR session is arming or running,
+     * absent otherwise. Additive: omitted from the JSON when null.
      */
-    val xrClient: String? = null
+    val xrClient: String? = null,
+    /**
+     * Every VR driver this headset can speak, in preference order, as
+     * reported by the installed client packages. This is the head's half
+     * of the capability question a body answers with xr_drivers, and it is
+     * what lets the cluster match the two instead of assuming alvr.
+     * Omitted when empty, so an older head changes nothing.
+     */
+    val xrDrivers: List<String> = emptyList()
 ) {
     fun toJson(): JSONObject {
         val obj = JSONObject()
@@ -372,6 +380,9 @@ data class HeadDiagnostics(
         obj.put("moonlight_client_id", moonlightClientId ?: JSONObject.NULL)
         if (xrClient != null) {
             obj.put("xr_client", xrClient)
+        }
+        if (xrDrivers.isNotEmpty()) {
+            obj.put("xr_drivers", JSONArray(xrDrivers))
         }
         return obj
     }
