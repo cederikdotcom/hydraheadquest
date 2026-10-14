@@ -126,10 +126,13 @@ enroll, heartbeat, catalog, body selection, pairing, stream, stop, screenshot.
 - Expected: a JPEG returns within about 5 s. The app polls
   `/api/v1/heads/<head_id>/commands` every 3 s, sees `{"screenshot": true}`,
   captures, and uploads raw JPEG bytes.
-- The image must show the app UI (grid, overlays, error screens). The video
-  surface may capture black, as on the iPad; that is acceptable for kiosk
-  diagnosis. Note the result: if the whole image is black even on the grid,
-  file an issue (MediaProjection fallback, open question in #544).
+- The image must show the app UI (grid, overlays, error screens) and a flat
+  stream (the video surface captures via PixelCopy). If the whole image is
+  black even on the grid, file an issue.
+- During an XR stream the headset view cannot be captured (it renders in the
+  separate ALVR or WiVRn client's XR swapchain). Expected in that case: a
+  labelled card JPEG that reads "XR stream in progress", not a black frame
+  and not a 504. A black frame here would be a regression (issue #790).
 - A 504 means the headset did not answer the command poll. Check `last_seen`
   and the headset's network before blaming the build.
 
@@ -146,6 +149,8 @@ enroll, heartbeat, catalog, body selection, pairing, stream, stop, screenshot.
   `diagnostics.version`, `diagnostics.routing` matching how step 4 reached the
   body (`wireguard` for a `10.10.` host, `lan` otherwise), and
   `diagnostics.latency_ms` a number, not `?`.
+- After at least one stream this run, `diagnostics.last_stream_start_ms` is a
+  positive integer (tap to visible). It is absent before the first stream.
 
 ### Pass criteria
 
