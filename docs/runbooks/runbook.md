@@ -1,6 +1,6 @@
 # hydraheadquest Runbook
 
-## Status: Phase 1 scaffold (issue #544 on issues.experiencenet.com)
+## Status: flat and immersive XR working; fleet onboarding by side-load (issue #544; client polish under #781)
 
 ## What this repo is
 
@@ -134,10 +134,59 @@ The Quest's IP is in headset settings under Wi-Fi details, or in the venue
 router's DHCP leases. The TCP adb mode survives until reboot. WDAC-style
 restrictions do not apply here; this is our own APK on our own device.
 
-## HMS deploy lane (NOT YET SET UP)
+## Fleet onboarding (several headsets at once)
 
-The fleet lane is Meta Horizon Managed Services (HMS). It is free and it is
-the required path for managed Quests. Planned shape, not yet configured:
+The lane for bringing up several Quests together, for example the first five
+Quest 3 units (2026-10). Side-loading is the path: the owner ruled no Meta
+release, so HMS is out (#739). Each headset is installed once by hand, then
+manages itself through the cluster.
+
+Prepare once:
+
+- Put every headset's Meta account in the same Meta developer organization, so
+  Developer Mode can be enabled on each (Sideload deploy, step 1).
+- Download the signed APK for the release you are rolling, once, to the
+  workstation: `hydraheadquest-<version>.apk` from the GitHub release.
+
+Verify on one headset before the batch. A tag is not a tested build, and the
+flat decoder only proves out at stream start, not at app launch:
+
+1. Enable Developer Mode on the first headset and reboot (Sideload deploy,
+   step 1). Accept the USB-debugging prompt with the headset on.
+2. `adb install -r hydraheadquest-<version>.apk` over USB.
+3. Confirm Horizon home shows ONE landscape "Hydra Kiosk" tile, not a second
+   portrait "Moonlight" tile (#791). Open it.
+4. QR-enroll (Enrollment against hydracluster). Confirm the head appears as
+   `quest-head-<id6>`, a unique name.
+5. Start a flat experience. Confirm it streams, and that the head record shows
+   `diagnostics.last_stream_start_ms` as a number (#789). Trigger a remote
+   screenshot and confirm a real frame of the grid, not black (#790).
+
+Only when that unit passes do you roll to the rest.
+
+Roll to the remaining headsets. For each: enable Developer Mode, reboot,
+accept the USB-debugging prompt, then install the SAME APK. `adb devices`
+lists each connected headset's serial; target one with `-s <serial>` when
+several are attached:
+
+```sh
+adb devices                              # note each serial
+adb -s <serial> install -r hydraheadquest-<version>.apk
+```
+
+Enroll each with the same fleet QR. Names are auto-unique per device (Head
+naming convention), so there is no collision and no per-device config.
+
+After install, adb is only for debugging. Screenshots, commands and the
+heartbeat all run over the cluster once a head is enrolled. adb over wifi
+(`adb tcpip 5555` then `adb connect <ip>:5555`) is handy for a one-off debug
+of a single unit, but the TCP mode resets on reboot, so re-arm over USB.
+
+## HMS deploy lane (SUPERSEDED, see #739)
+
+Superseded 2026-09-16: the owner ruled no Meta release, so HMS Shared Mode is
+out and side-loading is the accepted lane (#739). This section is kept for
+context only; use Fleet onboarding above. The original plan was:
 
 - Enroll headsets in HMS Shared Mode. No per-device Meta accounts.
 - Use the HMS built-in Device Manager to deploy the APK as a private app from
