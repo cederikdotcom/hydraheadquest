@@ -95,6 +95,11 @@ class HydraApp : Application() {
 
             override fun onActivityResumed(activity: Activity) {
                 currentActivity = activity
+                // GameXR extends Game, so this covers both flat stream
+                // windows. Reports the stream start time (issue #789).
+                if (activity is Game) {
+                    streamHooks.onGameActivityResumed()
+                }
             }
 
             override fun onActivityPaused(activity: Activity) {

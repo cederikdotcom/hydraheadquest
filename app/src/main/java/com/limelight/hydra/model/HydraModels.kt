@@ -366,7 +366,16 @@ data class HeadDiagnostics(
      * what lets the cluster match the two instead of assuming alvr.
      * Omitted when empty, so an older head changes nothing.
      */
-    val xrDrivers: List<String> = emptyList()
+    val xrDrivers: List<String> = emptyList(),
+    /**
+     * Milliseconds from the user starting an experience to the stream
+     * becoming visible, measured on the head. For a flat stream this is the
+     * tap to the Game activity being resumed; for an XR stream it is the tap
+     * to the body reporting the session armed and the client launched. Null
+     * until the first stream of the session starts, so an older head and a
+     * freshly enrolled head both omit it.
+     */
+    val lastStreamStartMs: Long? = null
 ) {
     fun toJson(): JSONObject {
         val obj = JSONObject()
@@ -383,6 +392,9 @@ data class HeadDiagnostics(
         }
         if (xrDrivers.isNotEmpty()) {
             obj.put("xr_drivers", JSONArray(xrDrivers))
+        }
+        if (lastStreamStartMs != null) {
+            obj.put("last_stream_start_ms", lastStreamStartMs)
         }
         return obj
     }

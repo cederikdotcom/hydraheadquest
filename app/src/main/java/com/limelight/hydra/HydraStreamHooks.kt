@@ -191,8 +191,10 @@ class HydraStreamHooks(
             appContext.startActivity(intent)
 
             // Established from Hydra's point of view: pairing done, session
-            // launch handed to Game. TODO(#544): report first-frame timing
-            // by observing the connection, without touching upstream Game.
+            // launch handed to Game. The stream start time is recorded when
+            // the Game window is first resumed (onGameActivityResumed ->
+            // HydraState.onGameShown, issue #789), the closest signal to
+            // first frame without touching upstream Game.
             state.onStreamEstablished(host, experience, bodyId, serverCert, selfService)
         } catch (e: Exception) {
             Log.w(TAG, "launchStream failed: ${e.message}")
@@ -230,6 +232,16 @@ class HydraStreamHooks(
             return
         }
         state.onStreamEnded()
+    }
+
+    /**
+     * A Game or GameXR activity became visible: the flat stream window is
+     * on screen, the closest signal this class has to first frame without
+     * touching upstream Game. Lets HydraState record the stream start time
+     * (issue #789).
+     */
+    fun onGameActivityResumed() {
+        state.onGameShown()
     }
 
     // ------------------------------------------------------------------

@@ -2,6 +2,9 @@ package com.limelight.hydra
 
 import android.app.Activity
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -17,10 +20,11 @@ import java.util.concurrent.atomic.AtomicInteger
  * command (contract section 9). Uses PixelCopy, which reads the composited
  * window including SurfaceView content on API 26+.
  *
- * Known caveat, same as the Metal layer on iPad: the streaming video
- * surface may still capture black on some devices. TODO(#544):
- * MediaProjection fallback if Quest captures black during streams. The
- * wire contract (raw JPEG POST) stays the same either way.
+ * A flat stream captures fine, SurfaceView content included. An XR stream
+ * cannot be captured here at all: it renders in a separate client app's XR
+ * swapchain (issue #790). HydraState handles that case before calling this,
+ * and uses [placeholder] to send the operator an honest labelled card. The
+ * wire contract (raw JPEG POST) is the same for both.
  */
 object HydraScreenshot {
 
@@ -81,6 +85,80 @@ object HydraScreenshot {
         } finally {
             thread.quitSafely()
             bitmap.recycle()
+        }
+    }
+
+    /**
+     * Render a labelled card as JPEG bytes, for the cases where a real
+     * capture is impossible but the operator still deserves an honest
+     * frame instead of nothing or a black rectangle (issue #790). The
+     * clearest example is an XR stream: the headset view renders in the
+     * separate ALVR or WiVRn client's XR swapchain, which is another
+     * process this app cannot read, so there is genuinely nothing in our
+     * window to capture. This needs no Activity, so the command poll can
+     * build it directly. Returns null only if drawing itself throws.
+     */
+    fun placeholder(title: String, detail: String): ByteArray? {
+        return try {
+            val width = 1024
+            val height = 640
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            try {
+                val canvas = Canvas(bitmap)
+                canvas.drawColor(Color.rgb(20, 22, 28))
+                val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.WHITE
+                    textSize = 48f
+                    textAlign = Paint.Align.CENTER
+                }
+                val detailPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.rgb(170, 176, 188)
+                    textSize = 30f
+                    textAlign = Paint.Align.CENTER
+                }
+                val cx = width / 2f
+                canvas.drawText(title, cx, height / 2f - 24f, titlePaint)
+                drawWrapped(canvas, detail, cx, height / 2f + 32f, detailPaint, width - 120)
+                val out = ByteArrayOutputStream()
+                bitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
+                out.toByteArray()
+            } finally {
+                bitmap.recycle()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "placeholder render failed: ${e.message}")
+            null
+        }
+    }
+
+    /** Word wrap [text] to [maxWidth] px and draw it centred at [cx]. */
+    private fun drawWrapped(
+        canvas: Canvas,
+        text: String,
+        cx: Float,
+        startY: Float,
+        paint: Paint,
+        maxWidth: Int
+    ) {
+        val lines = ArrayList<String>()
+        var line = StringBuilder()
+        for (word in text.split(" ")) {
+            val candidate = if (line.isEmpty()) word else "$line $word"
+            if (line.isNotEmpty() && paint.measureText(candidate) > maxWidth) {
+                lines.add(line.toString())
+                line = StringBuilder(word)
+            } else {
+                line = StringBuilder(candidate)
+            }
+        }
+        if (line.isNotEmpty()) {
+            lines.add(line.toString())
+        }
+        var y = startY
+        val lineHeight = paint.textSize * 1.3f
+        for (l in lines) {
+            canvas.drawText(l, cx, y, paint)
+            y += lineHeight
         }
     }
 }

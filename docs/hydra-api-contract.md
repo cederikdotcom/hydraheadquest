@@ -181,6 +181,12 @@ Field rules:
   here. WiVRn is preferred where both are installed, since its server runs
   on Linux bodies and carries the PyroWave codec; ALVR remains the answer
   for a Windows body, which WiVRn's Monado-based server cannot serve.
+- `last_stream_start_ms`: optional integer. Milliseconds from the user
+  starting an experience to the stream becoming visible, measured on the
+  head. A flat stream measures the tap to the Game window being resumed; an
+  XR stream measures the tap to the body reporting the session armed and the
+  client launched. Omitted until the first stream of the process, so an older
+  or freshly enrolled head changes nothing.
 
 No response body is consumed. Only the status code matters.
 
@@ -380,8 +386,12 @@ When `screenshot` is true, capture the current screen, encode as JPEG
 - `Content-Type: image/jpeg`
 - Body: raw JPEG bytes. No JSON wrapper, no multipart.
 
-Quest note: rendering surfaces may capture black, like the Metal layer on iPad.
-MediaProjection may be needed. The wire contract stays the same.
+Quest note: a flat stream captures fine (PixelCopy reads the SurfaceView on
+API 26+). An XR stream cannot be captured from the head at all, because it
+renders in the separate ALVR or WiVRn client's XR swapchain, another process.
+In that case, and when no activity is in the foreground, the head uploads a
+labelled JPEG card that states why, rather than a black frame or nothing. The
+wire contract (raw JPEG POST) stays the same.
 
 ## 10. Head state machine
 

@@ -227,11 +227,14 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
     /**
      * Screenshot provider for the remote screenshot command. Returns JPEG
      * bytes (quality 70) or null when capture is not possible. HydraApp
-     * wires this to [HydraScreenshot] (PixelCopy of the current activity).
+     * wires this to [HydraScreenshot] (PixelCopy of the current activity),
+     * which captures a flat stream (SurfaceView included on API 26+).
      *
-     * TODO(#544): the streaming video surface may capture black on Quest,
-     * same as the Metal capture issue on iPad. MediaProjection may be
-     * needed for stream frames. The wire contract is unaffected.
+     * An XR stream cannot be captured at all: it renders in the separate
+     * ALVR or WiVRn client's XR swapchain, another process this app cannot
+     * read (issue #790). [captureScreenshotOrExplain] detects that case and
+     * the no-foreground case and returns a labelled card, so the operator
+     * always gets an honest frame instead of a black one or nothing.
      */
     @Volatile
     var screenshotProvider: (() -> ByteArray?)? = null
@@ -321,6 +324,25 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
      * the head-side 180 s cap. Executor-confined.
      */
     private var xrArmingStartedAt: Long = 0L
+
+    /**
+     * When the user started the current experience (elapsedRealtime ms),
+     * used to measure the stream start time reported in diagnostics
+     * (issue #789). Set in [startExperience], consumed once by
+     * [recordStreamShown], then zeroed so an unrelated later resume cannot
+     * record a stale value. Written from the executor and the main thread
+     * (the lifecycle callback), so it is volatile.
+     */
+    @Volatile
+    private var streamLaunchStartedAt: Long = 0L
+
+    /**
+     * The last measured stream start time in ms, or null before the first
+     * stream of this process. Reported as last_stream_start_ms in the
+     * heartbeat and the operator diagnostics view.
+     */
+    @Volatile
+    private var lastStreamStartMs: Long? = null
 
     // ------------------------------------------------------------------
     // Lifecycle
@@ -584,6 +606,35 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
         }
     }
 
+    /**
+     * A stream activity (Game) became visible in this process, so the flat
+     * stream is showing. Records the stream start time (issue #789). Called
+     * from the main thread by HydraApp's lifecycle callback; hops to the
+     * executor so the timing fields stay confined there.
+     */
+    fun onGameShown() {
+        executor.execute { recordStreamShown("flat") }
+    }
+
+    /**
+     * Consume the launch-start mark set in [startExperience] and record the
+     * stream start time, once. [lane] only labels the log line. A 120 s
+     * ceiling drops a stale mark, for example an unrelated resume long after
+     * a start that never produced a stream. Executor-confined.
+     */
+    private fun recordStreamShown(lane: String) {
+        val start = streamLaunchStartedAt
+        if (start <= 0L) {
+            return
+        }
+        streamLaunchStartedAt = 0L
+        val delta = SystemClock.elapsedRealtime() - start
+        if (delta in 1L..120000L) {
+            lastStreamStartMs = delta
+            Log.i(TAG, "stream start ($lane): $delta ms")
+        }
+    }
+
     /** The user dismissed the error screen. */
     fun onErrorDismissed() {
         executor.execute {
@@ -752,6 +803,9 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
     // ------------------------------------------------------------------
 
     private fun startExperience(experience: Experience, selfService: Boolean) {
+        // Mark the start of both lanes here so the stream start time covers
+        // discovery, pairing or arming, and the launch (issue #789).
+        streamLaunchStartedAt = SystemClock.elapsedRealtime()
         if (experience.isXr) {
             // The immersive ALVR path (issue #558). The flat flow below
             // stays byte-identical for every other experience.
@@ -1034,6 +1088,9 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
                         current.host, current.experience, current.bodyId, xrSelfService
                     )
                 )
+                // The body armed and the client launched: the XR stream is
+                // starting from the head's point of view (issue #789).
+                recordStreamShown("xr")
                 // Already on the 5 s cadence; the StreamingXr poll keeps it.
             }
             session == null ||
@@ -1248,7 +1305,8 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
             localIp = localIpAddress(),
             moonlightClientId = clientId,
             xrClient = xrClient,
-            xrDrivers = xrDrivers
+            xrDrivers = xrDrivers,
+            lastStreamStartMs = lastStreamStartMs
         )
     }
 
@@ -1310,16 +1368,48 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
             val apiClient = client ?: return
             val command = apiClient.getCommands()
             if (command.screenshot) {
-                val bytes = screenshotProvider?.invoke()
+                val bytes = captureScreenshotOrExplain()
                 if (bytes != null) {
                     apiClient.postScreenshot(bytes)
                 } else {
-                    Log.w(TAG, "screenshot requested but no provider available")
+                    Log.w(TAG, "screenshot requested but none could be produced")
                 }
             }
         } catch (e: Exception) {
             Log.w(TAG, "command poll failed: ${e.message}")
         }
+    }
+
+    /**
+     * Produce the screenshot bytes for the remote command (issue #790). An
+     * XR stream renders in the separate ALVR or WiVRn client's XR swapchain,
+     * another process this app cannot read, so there is nothing in our
+     * window to capture. Rather than upload a black frame or send nothing,
+     * return a labelled card that tells the operator why. A failed real
+     * capture (no foreground activity) gets the same honest treatment.
+     */
+    private fun captureScreenshotOrExplain(): ByteArray? {
+        if (state is State.StreamingXr) {
+            val driver = xrHooks?.driverName ?: "XR"
+            return HydraScreenshot.placeholder(
+                "XR stream in progress",
+                "The headset view renders in the $driver client, which the " +
+                    "kiosk cannot capture. Watch the stream on the body instead."
+            )
+        }
+        val real = try {
+            screenshotProvider?.invoke()
+        } catch (e: Exception) {
+            Log.w(TAG, "screenshot provider threw: ${e.message}")
+            null
+        }
+        if (real != null) {
+            return real
+        }
+        return HydraScreenshot.placeholder(
+            "No screen to capture",
+            "The kiosk is not in the foreground right now."
+        )
     }
 
     // ------------------------------------------------------------------
