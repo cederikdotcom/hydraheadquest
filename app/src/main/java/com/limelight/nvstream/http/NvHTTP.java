@@ -62,6 +62,10 @@ import okhttp3.ResponseBody;
 
 public class NvHTTP {
     private String uniqueId;
+    // The devicename sent in the GameStream pair request. Hydra sets this to
+    // the head id so stored Sunshine certs are attributable per head
+    // (issue #549); defaults to the legacy "roth".
+    private String deviceName = "roth";
     private PairingManager pm;
 
     private static final int DEFAULT_HTTPS_PORT = 47984;
@@ -200,9 +204,13 @@ public class NvHTTP {
     }
     
     public NvHTTP(ComputerDetails.AddressTuple address, int httpsPort, String uniqueId, X509Certificate serverCert, LimelightCryptoProvider cryptoProvider) throws IOException {
-        // Use the same UID for all Moonlight clients so we can quit games
-        // started by other Moonlight clients.
-        this.uniqueId = "0123456789ABCDEF";
+        // Moonlight historically used one shared UID for all clients so they
+        // could quit each other's games. Hydra passes a per-head UID
+        // (issues #531/#549): Sunshine keys its pending-pair session by
+        // uniqueid, so a shared id lets one head's abandoned pair poison the
+        // next head's, and a 2026.914 body rejects a duplicate uniqueid
+        // outright. Fall back to the legacy constant when no id is supplied.
+        this.uniqueId = (uniqueId != null && !uniqueId.isEmpty()) ? uniqueId : "0123456789ABCDEF";
 
         this.serverCert = serverCert;
 
@@ -703,14 +711,21 @@ public class NvHTTP {
         }
     }
 
+    /** Set the devicename sent in the pair request (Hydra: the head id). */
+    public void setDeviceName(String deviceName) {
+        if (deviceName != null && !deviceName.isEmpty()) {
+            this.deviceName = deviceName;
+        }
+    }
+
     String executePairingCommand(String additionalArguments, boolean enableReadTimeout) throws HostHttpResponseException, IOException {
         return openHttpConnectionToString(enableReadTimeout ? httpClientLongConnectTimeout : httpClientLongConnectNoReadTimeout,
-                baseUrlHttp, "pair", "devicename=roth&updateState=1&" + additionalArguments);
+                baseUrlHttp, "pair", "devicename=" + deviceName + "&updateState=1&" + additionalArguments);
     }
 
     String executePairingChallenge() throws HostHttpResponseException, IOException {
         return openHttpConnectionToString(httpClientLongConnectTimeout, getHttpsUrl(true),
-                "pair", "devicename=roth&updateState=1&phrase=pairchallenge");
+                "pair", "devicename=" + deviceName + "&updateState=1&phrase=pairchallenge");
     }
 
     public void unpair() throws IOException {

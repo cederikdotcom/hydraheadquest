@@ -29,8 +29,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  *    request goes out, because Sunshine only accepts the PIN while the
  *    /pair getservercert request is pending.
  * 3. Already paired (PairStatus 1 in serverinfo, or an ALREADY_IN_PROGRESS
- *    result): unpair with the same uniqueid the pairing code uses (NvHTTP
- *    hardcodes 0123456789ABCDEF), then pair again, at most once. On a
+ *    result): unpair with the same per-head uniqueid the pairing code uses
+ *    (HydraIdentity derives it from the head id), then pair again, at most
+ *    once. On a
  *    second already-paired outcome, proceed with an empty certificate.
  *    The server certificate is never cached across sessions.
  * 4. Look up the Sunshine app named by the experience (= stream_app_id),
@@ -121,10 +122,15 @@ class HydraStreamHooks(
         try {
             val crypto = PlatformBinding.getCryptoProvider(appContext)
             val tuple = ComputerDetails.AddressTuple(host, NvHTTP.DEFAULT_HTTP_PORT)
+            // Per-head GameStream identity (issues #531/#549): derive the
+            // uniqueid and devicename from this head's id so Sunshine does
+            // not confuse or poison this head's pairing session with another
+            // head's. Falls back to the legacy shared id before enrollment.
             // httpsPort 0 = unknown; NvHTTP fetches it from /serverinfo.
-            // uniqueId is hardcoded to 0123456789ABCDEF inside NvHTTP, the
-            // same id the unpair request must carry (contract section 7).
-            val http = NvHTTP(tuple, 0, null, null, crypto)
+            val headId = state.currentHeadId()
+            val uniqueId = HydraIdentity.gamestreamUniqueId(headId)
+            val http = NvHTTP(tuple, 0, uniqueId, null, crypto)
+            http.setDeviceName(HydraIdentity.gamestreamDeviceName(headId))
 
             var serverInfo = http.getServerInfo(true)
             var unpairAttempted = false
