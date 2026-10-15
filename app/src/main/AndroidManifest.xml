@@ -73,13 +73,14 @@
          this; the XR pre-flight check needs it before launching a client
          by explicit intent. ALVR and WiVRn are peers: which one a session
          uses is decided by the driver the body advertises.
-         org.meumeu.wivrn.github.testing is the debug-signed build used for
-         the first PyroWave tests; it is listed so a developer headset can
-         be told apart from a production one, never to be launched as if it
-         were the real client -->
+         WiVRn client: com.experiencenet.hydrawivrn is our signed build
+         (#739, not yet shipped); org.meumeu.wivrn.github.testing is the
+         debug-signed upstream build, used as a FALLBACK until ours ships so
+         the lane can be exercised on a dev headset. WivrnLauncher prefers
+         ours when both are present. -->
     <queries>
         <package android:name="alvr.client.stable" />
-        <package android:name="com.experiencenet.hydraxr" />
+        <package android:name="com.experiencenet.hydrawivrn" />
         <package android:name="org.meumeu.wivrn.github.testing" />
     </queries>
 

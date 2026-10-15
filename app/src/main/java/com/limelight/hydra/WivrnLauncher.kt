@@ -35,7 +35,8 @@ import android.util.Log
  * Launch facts:
  * - The entry point is <package>/org.meumeu.wivrn.MainActivity. The Java
  *   package stays org.meumeu.* even when the applicationId is ours, so the
- *   activity name does not move with the package id.
+ *   activity name does not move with the package id, and the same activity
+ *   name works for our build and the upstream one.
  * - The intent MUST carry category com.oculus.intent.category.VR, for the
  *   same vrshell reason ALVR does.
  * - The intent sets an EXPLICIT component. That matters here: the client's
@@ -44,23 +45,35 @@ import android.util.Log
  *   An explicit component skips filter matching entirely.
  * - The launch must come from a foreground activity, as with ALVR.
  *
- * Package visibility for Android 11+ is declared in AndroidManifest.xml.
+ * Package visibility for Android 11+ is declared in AndroidManifest.xml for
+ * every candidate package.
  */
 class WivrnLauncher(
     context: Context,
-    private val packageName: String = DEFAULT_PACKAGE,
+    private val candidatePackages: List<String> = CANDIDATE_PACKAGES,
 ) : HydraState.XrHooks {
 
     companion object {
         private const val TAG = "WivrnLauncher"
 
         /**
-         * The Hydra-signed client. The debug-signed build that was
-         * side-loaded for the first PyroWave tests is
-         * org.meumeu.wivrn.github.testing; it is deliberately NOT the
-         * default, so a test build never satisfies a production head.
+         * The Hydra-signed WiVRn client (#739). Named hydrawivrn, not a
+         * generic "xr" name: WiVRn is the only VR client we build, since
+         * ALVR is launched as the stock upstream app, so there is no unified
+         * client that an "xr" name would describe.
          */
-        const val DEFAULT_PACKAGE = "com.experiencenet.hydraxr"
+        const val OUR_PACKAGE = "com.experiencenet.hydrawivrn"
+
+        /**
+         * The debug-signed upstream build side-loaded for the first PyroWave
+         * tests. A FALLBACK until the signed hydrawivrn client (#739) ships,
+         * so the lane can be exercised on a dev headset now. Our own client
+         * always wins when both are present.
+         */
+        const val UPSTREAM_PACKAGE = "org.meumeu.wivrn.github.testing"
+
+        /** Preference order: our signed client first, upstream test build second. */
+        val CANDIDATE_PACKAGES = listOf(OUR_PACKAGE, UPSTREAM_PACKAGE)
 
         /** Entry activity. The Java package does not follow the app id. */
         const val WIVRN_ACTIVITY = "org.meumeu.wivrn.MainActivity"
@@ -85,17 +98,27 @@ class WivrnLauncher(
 
     override val driverName: String = XrDrivers.WIVRN
 
-    override fun isXrClientInstalled(): Boolean {
-        return try {
-            appContext.packageManager.getPackageInfo(packageName, 0)
-            true
-        } catch (e: PackageManager.NameNotFoundException) {
-            false
-        } catch (e: Exception) {
-            Log.w(TAG, "WiVRn package query failed: ${e.message}")
-            false
+    /**
+     * The first candidate package actually installed, in preference order,
+     * or null when none is present. Our signed client wins over the upstream
+     * test build.
+     */
+    private fun resolvedPackage(): String? {
+        val pm = appContext.packageManager
+        for (pkg in candidatePackages) {
+            try {
+                pm.getPackageInfo(pkg, 0)
+                return pkg
+            } catch (e: PackageManager.NameNotFoundException) {
+                // not this one; try the next candidate
+            } catch (e: Exception) {
+                Log.w(TAG, "WiVRn package query failed for $pkg: ${e.message}")
+            }
         }
+        return null
     }
+
+    override fun isXrClientInstalled(): Boolean = resolvedPackage() != null
 
     override fun launchXrClient(): Boolean = launchXrClient(null, null)
 
@@ -104,6 +127,11 @@ class WivrnLauncher(
      * known. With neither, the client falls back to its own discovery.
      */
     fun launchXrClient(bodyHost: String?, pin: String?): Boolean {
+        val pkg = resolvedPackage()
+        if (pkg == null) {
+            Log.w(TAG, "no WiVRn client installed (looked for $candidatePackages)")
+            return false
+        }
         val activity = HydraApp.from(appContext).currentActivity
         if (activity == null) {
             Log.w(TAG, "no foreground activity; vrshell would reject the VR launch")
@@ -111,7 +139,7 @@ class WivrnLauncher(
         }
         return try {
             val intent = Intent().apply {
-                component = ComponentName(packageName, WIVRN_ACTIVITY)
+                component = ComponentName(pkg, WIVRN_ACTIVITY)
                 addCategory(CATEGORY_VR)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 if (!bodyHost.isNullOrEmpty()) {
@@ -121,7 +149,7 @@ class WivrnLauncher(
             }
             activity.startActivity(intent)
             // Never log the URI itself: the PIN is in it.
-            Log.i(TAG, "launched WiVRn client" + if (bodyHost.isNullOrEmpty()) "" else " -> $bodyHost")
+            Log.i(TAG, "launched WiVRn client ($pkg)" + if (bodyHost.isNullOrEmpty()) "" else " -> $bodyHost")
             true
         } catch (e: Exception) {
             Log.w(TAG, "WiVRn launch failed: ${e.message}")
