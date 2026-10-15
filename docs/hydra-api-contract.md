@@ -311,16 +311,47 @@ Sequence, as implemented in `HydraPairSession.m`:
    stream session.
 5. On `alreadyPaired`: the response carries no server certificate. Unpair, then
    pair again:
-   - `GET http://<host>:47989/unpair?uniqueid=<moonlight unique id>`
-   - The unique id must be the SAME id the Moonlight HTTP layer uses for pairing
-     (the iOS library hardcodes `0123456789ABCDEF`). A different id makes Sunshine
-     ignore the unpair request.
+   - `GET http://<host>:47989/unpair?uniqueid=<this head's unique id>`
+   - The unique id must be the SAME id the head used for pairing. A different id
+     makes Sunshine ignore the unpair request.
    - Re-pair regardless of the unpair result. Guard with a flag so unpair is
      attempted at most once. On a second `alreadyPaired`, return an empty
      certificate and let the caller proceed.
 
 Credentials come from head config `sunshine_username` / `sunshine_password`, with
 `sunshine` / `sunshine` as fallback for both.
+
+### Per-head pairing identity (issues #531, #549)
+
+Heads MUST NOT share one pairing identity. Sunshine keys its pending-pair session
+by `uniqueid`, so a shared id lets one head's abandoned pair corrupt another's
+(phase-4 cert desync), and a Sunshine 2026.914 body rejects a duplicate `uniqueid`
+outright. Each head derives its own, identically across head types:
+
+- `uniqueid` = first 8 bytes of `SHA-256(head id)`, 16 uppercase hex.
+- `devicename` = the head id verbatim.
+- A head with no id yet (pre-enrollment) falls back to the legacy shared
+  `0123456789ABCDEF` / `roth` so it can still pair.
+
+hydraheadquest derives this (`HydraIdentity`); hydraheadflatscreen does the same
+(`gamestreamIdentity`). The iPad still hardcodes the legacy id until it is ported.
+
+### PIN submission on Sunshine 2026.914 (issue #549 item 4)
+
+2025.924 accepts the bare `{"pin":"<PIN>"}` above. 2026.914 requires a
+server-minted pairing id and a name:
+
+1. After `getservercert` is in flight, `GET https://<host>:47990/api/pin` (same
+   Basic auth) returns `{"pairings":[{"address":"<client ip>","id":"<32 lc hex>",
+   "name":"<devicename>"}]}`; entries appear ~2 s later.
+2. Match YOUR entry by `address` (the head's source ip toward the body), not by
+   `name`. Refuse on no match or more than one match.
+3. `POST https://<host>:47990/api/pin` with
+   `{"pin":"<PIN>","name":"<head id>","pairing_id":"<id>"}`.
+
+On any non-200 from the GET, fall back to the bare `{"pin"}` body, so a 2025.924
+body is never sent a payload it did not ask for. Carry Sunshine's
+`status_message` into any error.
 
 ## 8. Stream lifecycle
 
