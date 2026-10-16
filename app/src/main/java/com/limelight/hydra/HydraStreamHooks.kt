@@ -271,11 +271,18 @@ class HydraStreamHooks(
         val pinThread = Thread({
             try {
                 Thread.sleep(HydraState.PIN_POST_DELAY_MS)
+                val user = headConfig.effectiveSunshineUsername
+                val password = headConfig.effectiveSunshinePassword
+                // The server mints the pairing id only once getservercert is
+                // pending, which the delay above has just guaranteed. A body
+                // of the older generation reports nothing here and gets the
+                // legacy bare-pin body.
+                val pending = state.resolvePendingPairing(host, user, password)
+                if (pending != null) {
+                    Log.i(TAG, "pairing id minted by $host, posting the extended PIN body")
+                }
                 state.postPinToSunshine(
-                    host,
-                    headConfig.effectiveSunshineUsername,
-                    headConfig.effectiveSunshinePassword,
-                    pin
+                    host, user, password, pin, pending?.id, pending?.name
                 )
             } catch (e: Exception) {
                 Log.w(TAG, "Sunshine PIN post failed: ${e.message}")

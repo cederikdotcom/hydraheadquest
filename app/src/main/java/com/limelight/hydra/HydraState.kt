@@ -11,9 +11,12 @@ import com.limelight.hydra.model.Experience
 import com.limelight.hydra.model.HeadConfig
 import com.limelight.hydra.model.HeadDiagnostics
 import com.limelight.hydra.model.XrSessionState
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.net.DatagramSocket
 import java.net.HttpURLConnection
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.Socket
@@ -75,6 +78,96 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
 
         /** Timeout for the Sunshine PIN post. */
         const val PIN_POST_TIMEOUT_MS = 20000
+
+        /**
+         * Read a GET /api/pin response into pending pairings.
+         *
+         * Wire verified against a live Sunshine 2026.914.233613 body
+         * mid-handshake, envelope and all three field names:
+         *
+         *     {"pairings":[{"address":"10.10.100.11",
+         *                   "id":"e6223860b14a02089139f0b13b2f709e",
+         *                   "name":"roth"}]}
+         *
+         * `id` is 32 lowercase hex. `address` is the client's source IP as
+         * the server sees it, which is what makes address matching viable.
+         * `name` is the devicename the client sent, so it is the same
+         * useless `roth` for every head still on the legacy identity.
+         * Entries appear about two seconds after getservercert, and the list
+         * is `{"pairings":[]}` when idle.
+         *
+         * Fields are still read defensively, because one verified build is
+         * not every build: an entry with no usable id is skipped rather than
+         * guessed at, and a response shaped unlike this reads as "this body
+         * does not offer pending pairings" instead of failing the pair.
+         */
+        fun parsePendingPairings(text: String): List<PendingPairing> {
+            return try {
+                val entries: JSONArray = JSONObject(text).optJSONArray("pairings")
+                    ?: return emptyList()
+                (0 until entries.length()).mapNotNull { i ->
+                    val entry = entries.optJSONObject(i) ?: return@mapNotNull null
+                    val id = entry.optString("id", "")
+                    if (id.isEmpty()) return@mapNotNull null
+                    PendingPairing(
+                        id = id,
+                        name = entry.optString("name", "").ifEmpty { null },
+                        address = entry.optString("address", "").ifEmpty { null }
+                    )
+                }
+            } catch (e: org.json.JSONException) {
+                Log.w(TAG, "unparsable pending pairings: ${e.message}")
+                emptyList()
+            }
+        }
+
+        /**
+         * Pick this head's pending pairing out of the reported list.
+         *
+         * Filtering is by source address when the body reports one, never by
+         * name. A head on the legacy identity sends the same hardcoded
+         * devicename `roth` as every other, and even with HydraIdentity the
+         * address is the only field the SERVER observes rather than accepts
+         * from the client. More than one candidate throws rather than
+         * choosing: posting our PIN against another client's pairing id
+         * would pair the wrong device, and the symptom is a phase 4
+         * rejection indistinguishable from an unrelated bug.
+         */
+        @Throws(IOException::class)
+        fun selectPendingPairing(
+            pending: List<PendingPairing>,
+            localAddress: String?
+        ): PendingPairing? {
+            val candidates = if (localAddress != null && pending.any { it.address != null }) {
+                pending.filter { it.address == localAddress }
+            } else {
+                pending
+            }
+            return when (candidates.size) {
+                0 -> null
+                1 -> candidates[0]
+                else -> throw IOException(
+                    "refusing to guess among ${candidates.size} pending pairings"
+                )
+            }
+        }
+
+        /**
+         * The POST /api/pin body.
+         *
+         * `pairing_id` and `name` are added only when the body minted an id,
+         * which only the newer Sunshine generation does. An older body gets
+         * the bare form it accepts, rather than relying on it ignoring
+         * fields it does not know.
+         */
+        fun buildPinPayload(pin: String, pairingId: String?, deviceName: String?): String {
+            val payload = JSONObject().put("pin", pin)
+            if (pairingId != null) {
+                payload.put("pairing_id", pairingId)
+                if (deviceName != null) payload.put("name", deviceName)
+            }
+            return payload.toString()
+        }
 
         /**
          * Head-side cap on the XR arming wait. Sized above the cluster's
@@ -1416,45 +1509,163 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
     // Sunshine PIN post
     // ------------------------------------------------------------------
 
+    /** One pending pairing as Sunshine reports it on GET /api/pin. */
+    data class PendingPairing(val id: String, val name: String?, val address: String?)
+
+    /**
+     * Open a connection to the Sunshine API with Basic auth.
+     *
+     * Sunshine serves a self-signed certificate, so these connections trust
+     * all certs. Never apply this trust manager to hydracluster calls.
+     */
+    private fun openSunshineApi(host: String, path: String, username: String, password: String):
+        HttpURLConnection {
+        val conn = URL("https://$host:$SUNSHINE_API_PORT$path").openConnection() as HttpURLConnection
+        if (conn is HttpsURLConnection) {
+            conn.sslSocketFactory = insecureSslContext().socketFactory
+            conn.hostnameVerifier = HostnameVerifier { _, _ -> true }
+        }
+        conn.connectTimeout = PIN_POST_TIMEOUT_MS
+        conn.readTimeout = PIN_POST_TIMEOUT_MS
+        val credentials = android.util.Base64.encodeToString(
+            "$username:$password".toByteArray(StandardCharsets.UTF_8),
+            android.util.Base64.NO_WRAP
+        )
+        conn.setRequestProperty("Authorization", "Basic $credentials")
+        return conn
+    }
+
+    /**
+     * The local source address this head uses to reach [host].
+     *
+     * Connecting a datagram socket sends nothing on the wire; it only asks
+     * the kernel to pick a route and bind a source address. Returns null if
+     * the route cannot be resolved, in which case the caller must not try to
+     * identify its own pending pairing by address.
+     */
+    fun localAddressFor(host: String): String? = try {
+        DatagramSocket().use { socket ->
+            socket.connect(InetAddress.getByName(host), SUNSHINE_API_PORT)
+            socket.localAddress?.hostAddress
+        }
+    } catch (e: Exception) {
+        Log.w(TAG, "could not resolve a local address for $host: ${e.message}")
+        null
+    }
+
+    /**
+     * Pending pairings from GET https://host:47990/api/pin.
+     *
+     * The envelope `{"pairings":[...]}` is wire verified against a
+     * 2026.914 body. The per-entry names are derived from Sunshine's
+     * `pending_pairing_t`, NOT wire captured, so every field is read
+     * defensively and an entry without a usable id is skipped rather than
+     * guessed at. An empty list and a server with no such route both yield
+     * an empty result, which the caller treats as "legacy generation".
+     */
+    @Throws(IOException::class)
+    fun fetchPendingPairings(host: String, username: String, password: String): List<PendingPairing> {
+        val conn = openSunshineApi(host, "/api/pin", username, password)
+        try {
+            conn.requestMethod = "GET"
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                // Any refusal reads as "this body has no pending-pairing
+                // concept" and falls back to the legacy post, rather than
+                // failing the pair. A transient 500 on this route must not
+                // stop us pairing with a body that never needed an id. The
+                // code is logged so a real server fault stays visible
+                // instead of being silently absorbed.
+                Log.w(TAG, "pending pairings unavailable on $host: HTTP $code, using the legacy PIN post")
+                return emptyList()
+            }
+            val text = conn.inputStream.use { it.readBytes().toString(StandardCharsets.UTF_8) }
+            return parsePendingPairings(text)
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    /**
+     * This head's pending pairing, or null if the body does not mint one.
+     *
+     * The whole entry is returned rather than just the id so the caller can
+     * echo back the name the server itself recorded, instead of guessing it.
+     * 2026.914 does not actually validate `name` against the pending entry,
+     * so echoing it is not load bearing on that build, but guessing a value
+     * the server never recorded would be a worse default for builds that do.
+     */
+    @Throws(IOException::class)
+    fun resolvePendingPairing(host: String, username: String, password: String): PendingPairing? {
+        val pending = fetchPendingPairings(host, username, password)
+        if (pending.isEmpty()) return null
+        return selectPendingPairing(pending, localAddressFor(host))
+    }
+
     /**
      * Post the pairing PIN to the Sunshine API on the body.
      *
-     * POST https://host:47990/api/pin with Basic auth and body {"pin": ...}.
-     * Sunshine serves a self-signed certificate, so this one connection
-     * trusts all certs. Never apply this trust manager to hydracluster calls.
+     * POST https://host:47990/api/pin with Basic auth. Two generations of
+     * Sunshine want different bodies, and the fleet runs both:
+     *
+     * - 2025.924 and earlier accept `{"pin": ...}`.
+     * - 2026.914 requires a server minted 32 hex character `pairing_id`
+     *   plus a `name`, and rejects the bare form with HTTP 400
+     *   "pairing_id must contain exactly 32 hexadecimal characters". Every
+     *   cloud body runs this generation, so without the id a Quest head
+     *   cannot pair with the hyperscaler at all.
+     *
+     * So [pairingId] is included when the caller could resolve one, which
+     * only a body of the newer generation provides. Sending the richer body
+     * to an older body is avoided rather than relied upon, because its
+     * handling of unknown fields is not verified here.
      *
      * The caller must delay PIN_POST_DELAY_MS (0.3 s) after returning the PIN
      * from the pairing callback, so the PIN lands while the /pair
      * getservercert request is still pending.
      */
     @Throws(IOException::class)
-    fun postPinToSunshine(host: String, username: String, password: String, pin: String) {
-        val url = URL("https://$host:$SUNSHINE_API_PORT/api/pin")
-        val conn = url.openConnection() as HttpURLConnection
+    fun postPinToSunshine(
+        host: String,
+        username: String,
+        password: String,
+        pin: String,
+        pairingId: String? = null,
+        deviceName: String? = null
+    ) {
+        val conn = openSunshineApi(host, "/api/pin", username, password)
         try {
-            if (conn is HttpsURLConnection) {
-                conn.sslSocketFactory = insecureSslContext().socketFactory
-                conn.hostnameVerifier = HostnameVerifier { _, _ -> true }
-            }
             conn.requestMethod = "POST"
-            conn.connectTimeout = PIN_POST_TIMEOUT_MS
-            conn.readTimeout = PIN_POST_TIMEOUT_MS
-            val credentials = android.util.Base64.encodeToString(
-                "$username:$password".toByteArray(StandardCharsets.UTF_8),
-                android.util.Base64.NO_WRAP
-            )
-            conn.setRequestProperty("Authorization", "Basic $credentials")
             conn.setRequestProperty("Content-Type", "application/json")
             conn.doOutput = true
-            val body = JSONObject().put("pin", pin).toString()
+            val body = buildPinPayload(pin, pairingId, deviceName)
             conn.outputStream.use { it.write(body.toByteArray(StandardCharsets.UTF_8)) }
             val code = conn.responseCode
             if (code !in 200..299) {
-                throw IOException("Sunshine PIN post failed: HTTP $code")
+                // Newer Sunshine explains the refusal in the error body, and
+                // that sentence is the difference between a one-line fix and a
+                // day of guessing. Carry it into the exception message.
+                throw IOException("Sunshine PIN post failed: HTTP $code${sunshineReason(conn)}")
             }
         } finally {
             conn.disconnect()
         }
+    }
+
+    /**
+     * The `status_message` Sunshine returns with a refusal, formatted for
+     * appending to an error. Empty when the body carries no such field.
+     */
+    private fun sunshineReason(conn: HttpURLConnection): String = try {
+        val text = conn.errorStream?.use { it.readBytes().toString(StandardCharsets.UTF_8) }
+        if (text.isNullOrBlank()) {
+            ""
+        } else {
+            val message = JSONObject(text).optString("status_message", "")
+            if (message.isEmpty()) " body=${text.take(200)}" else " $message"
+        }
+    } catch (e: Exception) {
+        ""
     }
 
     private fun insecureSslContext(): SSLContext {
