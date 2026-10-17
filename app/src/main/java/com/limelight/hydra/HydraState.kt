@@ -163,17 +163,25 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
         /**
          * The POST /api/pin body.
          *
-         * `pairing_id` and `name` are added only when the body minted an id,
-         * which only the newer Sunshine generation does. An older body gets
-         * the bare form it accepts, rather than relying on it ignoring
-         * fields it does not know.
+         * `name` is sent ALWAYS, to both Sunshine generations. 2025.924
+         * defaults it to "" when absent, which is why the fleet's stored certs
+         * are nameless and indistinguishable from each other, and 2026.914
+         * rejects a missing one outright. Sending it unconditionally is what
+         * makes a stored cert attributable to the head that created it.
+         *
+         * That this is safe on the older build is measured, not assumed:
+         * chunky-turnip-23 is confirmed 2025.924.154138 and carries five rows
+         * named `node-8acd8c19`, written by hydraheadflatscreen, which has
+         * always sent the field. A probe against the same body returned HTTP
+         * 200 for both the bare body and the body carrying `name`.
+         *
+         * `pairing_id` stays conditional, because only the newer generation
+         * mints one and only it validates the field.
          */
         fun buildPinPayload(pin: String, pairingId: String?, deviceName: String?): String {
             val payload = JSONObject().put("pin", pin)
-            if (pairingId != null) {
-                payload.put("pairing_id", pairingId)
-                if (deviceName != null) payload.put("name", deviceName)
-            }
+            if (deviceName != null) payload.put("name", deviceName)
+            if (pairingId != null) payload.put("pairing_id", pairingId)
             return payload.toString()
         }
 

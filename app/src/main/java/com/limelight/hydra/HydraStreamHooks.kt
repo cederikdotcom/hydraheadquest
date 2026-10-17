@@ -281,8 +281,14 @@ class HydraStreamHooks(
                 if (pending != null) {
                     Log.i(TAG, "pairing id minted by $host, posting the extended PIN body")
                 }
+                // Prefer the name the SERVER recorded for this session; its own
+                // validation runs against that. Falling back to this head's id
+                // is what gives an older body, which mints no pending entry, an
+                // attributable cert row instead of a nameless one.
+                val name = pending?.name
+                    ?: HydraIdentity.gamestreamDeviceName(state.currentHeadId())
                 state.postPinToSunshine(
-                    host, user, password, pin, pending?.id, pending?.name
+                    host, user, password, pin, pending?.id, name
                 )
             } catch (e: Exception) {
                 Log.w(TAG, "Sunshine PIN post failed: ${e.message}")
