@@ -138,11 +138,19 @@ class HydraState(context: Context, private val store: HydraConfigStore) {
             pending: List<PendingPairing>,
             localAddress: String?
         ): PendingPairing? {
-            val candidates = if (localAddress != null && pending.any { it.address != null }) {
+            val matched = if (localAddress != null && pending.any { it.address != null }) {
                 pending.filter { it.address == localAddress }
             } else {
                 pending
             }
+            // Zero matches is not ambiguity, it is the absence of a usable
+            // discriminator, and it is the NORMAL state behind a masquerading
+            // neck: the body records the post-NAT address while we compare the
+            // private one we hold, so they can never be equal. Refusing there
+            // leaves a head behind a neck unable to pair at all, even alone.
+            // Fall back to the whole list, where exactly one entry on a body we
+            // are mid-handshake with is ours.
+            val candidates = if (matched.isEmpty()) pending else matched
             return when (candidates.size) {
                 0 -> null
                 1 -> candidates[0]
